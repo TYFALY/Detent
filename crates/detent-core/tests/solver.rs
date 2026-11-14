@@ -197,22 +197,89 @@ fn scene_guard_snaps_to_shot_frame() {
 #[test]
 fn scene_guard_refuses_to_cut_speech() {
     let mut idx = talk();
-    // Shot change in the middle of "second" (3650..4000).
+    // Out-point 3990 snaps to the "second"|"sentence." gap (4025). A shot
+    // change at 3900 lies 125 ms away, but moving there would drop 100 ms of
+    // the word "second" (3650..4000): more than the 60 ms edge tolerance.
     idx.visual.shots.push(ShotBoundary {
-        t_ms: 3_800,
-        frame: 114,
+        t_ms: 3_900,
+        frame: 117,
         score: 4.0,
     });
     let res = EdlSolver::default()
-        .solve(&edl(vec![clip(1_000, 3_760)]), &idx)
+        .solve(&edl(vec![clip(1_000, 3_990)]), &idx)
         .unwrap();
     assert!(
         res.report
             .diagnostics
             .iter()
-            .any(|d| d.code == "scene_collision" && d.level == Level::Warning)
+            .any(|d| d.code == "scene_collision" && d.level == Level::Warning),
+        "{:?}",
+        res.report
     );
-    assert_ne!(res.timeline.segments[0].video.end_frame, 114);
+    assert_ne!(res.timeline.segments[0].video.end_frame, 117);
+}
+
+#[test]
+fn scene_guard_trims_padded_word_edges_instead_of_flashing() {
+    // Regression (real commentary): the source's own edit sat 17-50 ms from
+    // a sentence end. Refusing to move left a 1-3 frame flash of the next
+    // shot to protect the padded tail of an ASR word. Overlaps within the
+    // 60 ms word-edge tolerance are now trimmed.
+    let mut idx = talk();
+    idx.visual.shots.push(ShotBoundary {
+        t_ms: 3_967,
+        frame: 119,
+        score: 4.0,
+    });
+    let res = EdlSolver::default()
+        .solve(&edl(vec![clip(1_000, 3_990)]), &idx)
+        .unwrap();
+    assert_eq!(
+        res.timeline.segments[0].video.end_frame, 119,
+        "{:?}",
+        res.report
+    );
+    assert!(
+        !res.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "scene_collision" || d.code == "cut_inside_word"),
+        "{:?}",
+        res.report.diagnostics
+    );
+}
+
+#[test]
+fn cuts_inside_contiguous_words_snap_to_boundaries() {
+    // Regression (real commentary): whisper words were back-to-back (zero
+    // gaps) and there were no pauses, so cuts stayed mid-word.
+    let mut idx = index(
+        &[
+            ("and", 1_000, 1_300),
+            ("look", 1_300, 1_620),
+            ("now,", 1_620, 2_000),
+            ("thirty-one", 2_000, 2_700),
+            ("thousand.", 2_700, 3_400),
+            ("Guys,", 3_400, 3_800),
+        ],
+        6_000,
+        fps30(),
+    );
+    idx.audio.pauses.clear();
+    let res = EdlSolver::default()
+        .solve(&edl(vec![clip(1_250, 3_330)]), &idx)
+        .unwrap();
+    let cut = &res.report.cuts[0];
+    assert!(cut.video_ms.0.abs_diff(1_300) <= 40, "{cut:?}");
+    assert!(cut.video_ms.1.abs_diff(3_400) <= 40, "{cut:?}");
+    assert!(
+        !res.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "cut_inside_word"),
+        "{:?}",
+        res.report.diagnostics
+    );
 }
 
 #[test]
@@ -540,6 +607,7 @@ fn arb_scenario() -> impl Strategy<Value = Scenario> {
                             output: OutputSpec {
                                 aspect,
                                 height: 1920,
+                                layout: Default::default(),
                             },
                         },
                     }
@@ -573,7 +641,7 @@ proptest! {
             prop_assert!(s.audio.len_us() > 0);
             // Cuts move at most snap tolerance + scene guard + one frame,
             // unless the collapse fallback restored the request.
-            let slack = (120 + 150) * 1_000 + fps.frame_duration_us();
+            let slack = (350 + 150) * 1_000 + fps.frame_duration_us();
             prop_assert!((s.video.start_us - c.start_ms as i64 * 1_000).abs() <= slack);
             prop_assert!((s.video.end_us - (c.end_ms as i64 * 1_000)).abs() <= slack);
         }

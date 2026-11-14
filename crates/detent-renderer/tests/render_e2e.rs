@@ -140,6 +140,7 @@ fn edl() -> SemanticEdl {
         output: OutputSpec {
             aspect: AspectPreset::Vertical9x16,
             height: 640,
+            layout: Default::default(),
         },
     }
 }
@@ -203,6 +204,7 @@ fn preview_uses_stream_copy_when_possible() {
     e.output = OutputSpec {
         aspect: AspectPreset::Source,
         height: 360,
+        layout: Default::default(),
     };
     let t = solve(&src, dir.path(), &e);
     assert!(copy_eligible(&t));

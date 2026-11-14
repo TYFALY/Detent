@@ -98,6 +98,38 @@ pub struct OutputFormat {
     pub height: u32,
     /// Frame rate (same as source).
     pub fps: FrameRate,
+    /// Composition of the picture inside the raster.
+    #[serde(default)]
+    pub layout: Layout,
+}
+
+/// Resolved composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub enum Layout {
+    /// Camera crops fill the whole raster.
+    #[default]
+    Crop,
+    /// Camera crops (source aspect) are scaled to `fg_width x fg_height` and
+    /// centred over a blurred fill of the raster.
+    FitBlur {
+        /// Foreground width (even).
+        fg_width: u32,
+        /// Foreground height (even).
+        fg_height: u32,
+    },
+}
+
+impl OutputFormat {
+    /// Size the camera crop is scaled to (the whole raster unless `FitBlur`).
+    pub fn picture_size(&self) -> (u32, u32) {
+        match self.layout {
+            Layout::Crop => (self.width, self.height),
+            Layout::FitBlur {
+                fg_width,
+                fg_height,
+            } => (fg_width, fg_height),
+        }
+    }
 }
 
 /// Source facts the renderer needs.
@@ -139,6 +171,9 @@ pub struct ResolvedTimeline {
 impl ResolvedTimeline {
     /// True when any segment needs a moving or non-identity crop.
     pub fn needs_reframe(&self) -> bool {
+        if matches!(self.output.layout, Layout::FitBlur { .. }) {
+            return true;
+        }
         let (sw, sh) = (f64::from(self.source.width), f64::from(self.source.height));
         let same_raster =
             self.output.width == self.source.width && self.output.height == self.source.height;
@@ -199,7 +234,8 @@ impl ResolvedTimeline {
         let mut video_total = 0_i64;
         let mut audio_total = 0_i64;
         let (sw, sh) = (f64::from(self.source.width), f64::from(self.source.height));
-        let aspect = f64::from(self.output.width) / f64::from(self.output.height.max(1));
+        let (pw, ph) = self.output.picture_size();
+        let aspect = f64::from(pw) / f64::from(ph.max(1));
         for (i, s) in self.segments.iter().enumerate() {
             let fr = s.video;
             if fr.frames() <= 0 {

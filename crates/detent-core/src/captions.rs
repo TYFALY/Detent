@@ -42,7 +42,12 @@ const WEAK_WORDS: &[&str] = &[
     "a", "an", "the", "of", "to", "in", "on", "at", "for", "with", "from", "by", "into", "onto",
     "about", "as", "over", "under", "and", "but", "or", "nor", "so", "yet", "if", "that", "than",
     "my", "your", "his", "her", "its", "our", "their", "this", "these", "those", "is", "are",
-    "was", "were", "be", "i", "we", "you", "it's", "i'm", "very", "not", "no",
+    "was", "were", "be", "i", "we", "you", "it's", "i'm", "very", "not", "no", "it", "he", "she",
+    "they", "such", "just", "really", "every", "some", "any", "each", "can", "will", "would",
+    "should", "could", "don't", "didn't", "won't", "can't",
+    // Number words bind to what they count ("one | week", "first | time").
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "twenty",
+    "hundred", "thousand", "million", "first", "last", "next",
 ];
 
 fn normalized(word: &str) -> String {
@@ -57,7 +62,14 @@ pub fn is_weak(word: &str) -> bool {
     if w.ends_with([',', '.', '!', '?', ';', ':', '…']) {
         return false;
     }
-    WEAK_WORDS.contains(&normalized(w).as_str())
+    // A bare number binds to its unit ("3 | cents", "26 | dollars").
+    let numeric = w
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == '$')
+        && w.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '$' | '.' | ',' | '%' | 'k'));
+    numeric || WEAK_WORDS.contains(&normalized(w).as_str())
 }
 
 fn ends_sentence(word: &str) -> bool {
@@ -393,6 +405,27 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+    }
+
+    #[test]
+    fn keeps_numbers_with_units_and_pronouns_with_verbs() {
+        // Regression (real commentary captions): "AT 3 / CENTS",
+        // "HIGH OF 26 / DOLLARS", "THE HIGHEST IT / WAS EVER".
+        for w in ["3", "26", "$8", "500,000", "it", "such", "one", "first"] {
+            assert!(is_weak(w), "{w} should bind to the next word");
+        }
+        for w in ["cents.", "8.30,", "dollars", "600."] {
+            assert!(!is_weak(w), "{w}");
+        }
+        let ws = words("cases are almost at 3 cents again legit");
+        let blocks = chunk(&ws, &[], &CaptionGrouping::default(), 0);
+        for b in &blocks[..blocks.len() - 1] {
+            assert!(
+                !is_weak(&b.words.last().unwrap().text),
+                "{:?}",
+                texts(&blocks)
+            );
+        }
     }
 
     #[test]

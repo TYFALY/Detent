@@ -177,6 +177,7 @@ pub fn run(input: Option<&Path>, seconds: f32) -> Result<()> {
         output: OutputSpec {
             aspect: AspectPreset::Vertical9x16,
             height: 1920,
+            layout: Default::default(),
         },
     };
     edl.motion_cues = synthetic_edl(i, 3, 1).motion_cues;
@@ -212,6 +213,7 @@ pub fn run(input: Option<&Path>, seconds: f32) -> Result<()> {
     prev.output = OutputSpec {
         aspect: AspectPreset::Source,
         height: v.map_or(1080, |v| v.height),
+        layout: Default::default(),
     };
     let t = EdlSolver::default().solve(&prev, i)?.timeline;
     let m = renderer.render(

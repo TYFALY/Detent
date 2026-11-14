@@ -225,6 +225,23 @@ pub struct OutputSpec {
     #[serde(default = "default_height")]
     #[schemars(range(min = 144, max = 4320))]
     pub height: u32,
+    /// How the source fills the output frame.
+    #[serde(default)]
+    pub layout: OutputLayout,
+}
+
+/// How the source picture fills the output raster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum OutputLayout {
+    /// Crop a window with the output aspect (camera tracks within the source).
+    /// Best for talking heads and vlogs.
+    #[default]
+    Crop,
+    /// Show the whole source frame (letterboxed, full width) over a blurred,
+    /// zoomed copy of itself. Best for screen recordings, gameplay and
+    /// reaction videos with a facecam inset, where cropping would discard the
+    /// content. Captions sit in the lower blurred band.
+    FitBlur,
 }
 
 fn default_height() -> u32 {
@@ -236,6 +253,7 @@ impl Default for OutputSpec {
         Self {
             aspect: AspectPreset::default(),
             height: default_height(),
+            layout: OutputLayout::default(),
         }
     }
 }

@@ -9,6 +9,7 @@
 
 use detent_core::ResolvedTimeline;
 use detent_core::camera::CameraPath;
+use detent_core::timeline::Layout;
 
 use crate::encoder::Encoder;
 use crate::expr::Hinges;
@@ -131,7 +132,10 @@ crop=w={ow}:h={oh}:x='min(max(0,({x})*iw),iw-{ow})':y='min(max(0,({y})*ih),ih-{o
 /// Builds the graph. `ass_file` is a path relative to FFmpeg's working dir.
 pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -> CompiledGraph {
     let src = (t.source.width, t.source.height);
-    let out = (t.output.width, t.output.height);
+    let raster = (t.output.width, t.output.height);
+    // The camera fills the picture area: the whole raster, or the FitBlur foreground.
+    let out = t.output.picture_size();
+    let fit_blur = matches!(t.output.layout, Layout::FitBlur { .. });
     let fps = t.source.fps;
     let frame_s = fps.frame_duration_us() as f64 / 1e6;
     let mut inputs = Vec::new();
@@ -150,10 +154,29 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
         let cam = camera_filter(&seg.camera, src, out)
             .map(|c| format!(",{c}"))
             .unwrap_or_default();
-        stmts.push(format!(
-            "[{v_in}:v:0]tpad=stop_mode=clone:stop=3,trim=end_frame={frames},setpts=PTS-STARTPTS{cam},setsar=1[v{i}]",
+        let head = format!(
+            "[{v_in}:v:0]tpad=stop_mode=clone:stop=3,trim=end_frame={frames},setpts=PTS-STARTPTS",
             frames = seg.video.frames(),
-        ));
+        );
+        if fit_blur {
+            // Blurred, darkened cover fill computed at quarter resolution
+            // (cheap), with the camera picture centred on top.
+            let (rw, rh) = raster;
+            let cam = camera_filter(&seg.camera, src, out)
+                .unwrap_or_else(|| format!("scale={}:{}", out.0, out.1));
+            stmts.push(format!("{head},split=2[f{i}][b{i}]"));
+            stmts.push(format!(
+                "[b{i}]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},boxblur=8:2,eq=brightness=-0.12:saturation=0.85,scale={rw}:{rh}:flags=bilinear,setsar=1[g{i}]",
+                bw = rw / 4 / 2 * 2,
+                bh = rh / 4 / 2 * 2,
+            ));
+            stmts.push(format!("[f{i}]{cam},setsar=1[p{i}]"));
+            stmts.push(format!(
+                "[g{i}][p{i}]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,setsar=1[v{i}]"
+            ));
+        } else {
+            stmts.push(format!("{head}{cam},setsar=1[v{i}]"));
+        }
         if t.source.has_audio {
             let a_in = inputs.len();
             let len = seg.audio.len_us() as f64 / 1e6;
@@ -238,6 +261,7 @@ mod tests {
             keyframes: keys,
             solved_frames: 30,
             punch_ins: 0,
+            subject_inset: false,
         }
     }
 
@@ -268,6 +292,7 @@ mod tests {
                 width: 1080,
                 height: 1920,
                 fps,
+                layout: Default::default(),
             },
             segments: vec![
                 seg(0, 30, 90, 0, path(vec![kf(0, 656.25, 607.5)])),
@@ -341,6 +366,38 @@ mod tests {
             "{f}"
         );
         assert!(!f.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn fit_blur_composites_picture_over_blurred_fill() {
+        let mut t = timeline();
+        t.output.layout = Layout::FitBlur {
+            fg_width: 1080,
+            fg_height: 608,
+        };
+        for s in &mut t.segments {
+            s.camera = path(vec![CropKeyframe {
+                t_us: 0,
+                x: 0.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0,
+            }]);
+        }
+        let f = compile(&t, Encoder::Libx264, None).filter;
+        assert!(f.contains("split=2[f0][b0]"), "{f}");
+        assert!(
+            f.contains(
+                "[b0]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,boxblur"
+            ),
+            "{f}"
+        );
+        assert!(f.contains("scale=1080:1920:flags=bilinear"), "{f}");
+        assert!(
+            f.contains("crop=1920:1080:0:0:exact=1,scale=1080:608"),
+            "{f}"
+        );
+        assert!(f.contains("[g0][p0]overlay=x=(W-w)/2:y=(H-h)/2"), "{f}");
     }
 
     #[test]

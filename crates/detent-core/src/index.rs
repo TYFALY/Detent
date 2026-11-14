@@ -316,6 +316,63 @@ impl MediaIndex {
             .any(|w| UsRange::new(ms_to_us(w.start_ms), ms_to_us(w.end_ms)).overlaps(probe))
     }
 
+    /// The word that strictly contains `t_us`, ignoring `edge_us` at either
+    /// end of the word (ASR word edges are only accurate to a few tens of ms).
+    pub fn word_containing(&self, t_us: i64, edge_us: i64) -> Option<&WordToken> {
+        let first = self
+            .transcript
+            .partition_point(|w| ms_to_us(w.start_ms) < t_us - ms_to_us(MAX_WORD_MS));
+        self.transcript[first..]
+            .iter()
+            .take_while(|w| ms_to_us(w.start_ms) < t_us)
+            .find(|w| {
+                let (s, e) = (ms_to_us(w.start_ms), ms_to_us(w.end_ms));
+                s + edge_us < t_us && t_us < e - edge_us
+            })
+    }
+
+    /// Total time (µs) that transcript words overlap `range`.
+    pub fn speech_overlap_us(&self, range: UsRange) -> i64 {
+        let first = self
+            .transcript
+            .partition_point(|w| ms_to_us(w.start_ms) < range.start_us - ms_to_us(MAX_WORD_MS));
+        self.transcript[first..]
+            .iter()
+            .take_while(|w| ms_to_us(w.start_ms) < range.end_us)
+            .map(|w| {
+                let (s, e) = (ms_to_us(w.start_ms), ms_to_us(w.end_ms));
+                (e.min(range.end_us) - s.max(range.start_us)).max(0)
+            })
+            .sum()
+    }
+
+    /// Index of the quietest envelope hop in `[lo_us, hi_us]`, as a time (µs).
+    pub fn quietest_in(&self, lo_us: i64, hi_us: i64) -> Option<i64> {
+        let hop_us = i64::from(self.audio.hop_ms.max(1)) * 1_000;
+        let n = self.audio.rms_dbfs.len() as i64;
+        let a = (lo_us.max(0) / hop_us).min(n);
+        let b = (hi_us.max(0) / hop_us + 1).min(n);
+        (a..b)
+            .min_by(|&x, &y| {
+                self.audio.rms_dbfs[x as usize].total_cmp(&self.audio.rms_dbfs[y as usize])
+            })
+            .map(|i| (i * hop_us + hop_us / 2).clamp(lo_us, hi_us))
+    }
+
+    /// Classifies what the subject boxes look like (see [`FramingHint`]).
+    pub fn framing_hint(&self) -> Option<FramingHint> {
+        let s = &self.visual.subjects;
+        if s.len() < 5 {
+            return None;
+        }
+        let small = s.iter().filter(|b| b.w < PIP_MAX_WIDTH).count();
+        Some(if small * 10 >= s.len() * 6 {
+            FramingHint::PipFacecam
+        } else {
+            FramingHint::FullFrameSubject
+        })
+    }
+
     /// True when `range` lies entirely inside a single detected pause.
     pub fn inside_pause(&self, range: UsRange) -> bool {
         self.audio.pauses.iter().any(|p| {
@@ -372,6 +429,21 @@ impl MediaIndex {
     }
 }
 
+/// Subject boxes narrower than this (fraction of frame width) are treated as
+/// a picture-in-picture facecam, not a person in the scene.
+pub const PIP_MAX_WIDTH: f32 = 0.12;
+
+/// What the footage looks like, from the subject detector's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum FramingHint {
+    /// Most subject boxes are tiny: a facecam inset over screen/game content.
+    /// Crop-tracking the face would discard the content; prefer the
+    /// `FitBlur` output layout.
+    PipFacecam,
+    /// The subject fills a meaningful part of the frame (talking head, vlog).
+    FullFrameSubject,
+}
+
 /// A bounded-size, token-efficient view of a [`MediaIndex`] for an LLM.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct IndexDigest {
@@ -393,6 +465,8 @@ pub struct IndexDigest {
     pub loudness_step_ms: u64,
     /// Contact sheet path, if any.
     pub contact_sheet: Option<String>,
+    /// Footage type inferred from subject sizes, if subjects were detected.
+    pub framing_hint: Option<FramingHint>,
 }
 
 /// Limits for [`MediaIndex::digest`].
@@ -408,6 +482,9 @@ pub struct DigestLimits {
     pub cut_windows: usize,
     /// Pause length (ms) that ends a phrase.
     pub phrase_gap_ms: u64,
+    /// Phrases are also split after sentence-final punctuation and at this
+    /// many words, so fast continuous speech stays readable.
+    pub phrase_max_words: usize,
 }
 
 impl Default for DigestLimits {
@@ -418,6 +495,7 @@ impl Default for DigestLimits {
             shots: 200,
             cut_windows: 400,
             phrase_gap_ms: 350,
+            phrase_max_words: 25,
         }
     }
 }
@@ -428,20 +506,32 @@ impl MediaIndex {
     pub fn digest(&self, limits: DigestLimits) -> IndexDigest {
         let mut phrases = Vec::new();
         let mut cur: Option<(u64, u64, String)> = None;
+        let mut words_in = 0_usize;
+        let mut sentence_ended = false;
         for w in &self.transcript {
             match cur.as_mut() {
-                Some((_, end, text)) if w.start_ms.saturating_sub(*end) < limits.phrase_gap_ms => {
+                Some((_, end, text))
+                    if w.start_ms.saturating_sub(*end) < limits.phrase_gap_ms
+                        && !sentence_ended
+                        && words_in < limits.phrase_max_words =>
+                {
                     text.push(' ');
                     text.push_str(w.word.trim());
                     *end = w.end_ms;
+                    words_in += 1;
                 }
                 _ => {
                     if let Some(p) = cur.take() {
                         phrases.push(p);
                     }
                     cur = Some((w.start_ms, w.end_ms, w.word.trim().to_owned()));
+                    words_in = 1;
                 }
             }
+            sentence_ended = w
+                .word
+                .trim_end_matches(['"', '\'', ')'])
+                .ends_with(['.', '?', '!']);
         }
         phrases.extend(cur);
 
@@ -491,6 +581,7 @@ impl MediaIndex {
             loudness_dbfs,
             loudness_step_ms: per as u64 * hop,
             contact_sheet: self.visual.contact_sheet.as_ref().map(|c| c.path.clone()),
+            framing_hint: self.framing_hint(),
         }
     }
 }

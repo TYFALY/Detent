@@ -48,6 +48,10 @@ pub struct CameraPath {
     pub solved_frames: u32,
     /// Number of punch-in events triggered (SpringPunchIn only).
     pub punch_ins: u32,
+    /// The detected subject in this segment is a picture-in-picture inset
+    /// (e.g. a facecam over screen content), so it was not tracked.
+    #[serde(default)]
+    pub subject_inset: bool,
 }
 
 impl CameraPath {
@@ -131,7 +135,12 @@ impl CameraParams {
             MotionPreset::SpringPunchIn => Self {
                 track_settle_s: Some(1.2),
                 zoom_settle_s: 0.28,
-                punch_zoom: 1.0 + 0.12 * k,
+                punch_zoom: 1.0
+                    + match intensity {
+                        Intensity::Subtle => 0.06,
+                        Intensity::Medium => 0.10,
+                        Intensity::Strong => 0.15,
+                    },
                 punch_hold_ms: 1_100,
                 ..base
             },
@@ -215,9 +224,29 @@ pub fn solve_segment(seg: &SegmentCamera<'_>) -> CameraPath {
     let t_ms =
         |k: usize| (seg.source_start_us + seg.fps.frame_to_us(k as i64)) as f64 / US_PER_MS as f64;
 
+    // A tiny "subject" is a facecam inset: tracking it would frame the corner
+    // of the screen and discard the content, so hold the centre instead.
+    let (seg_start_ms, seg_end_ms) = (t_ms(0), t_ms(n));
+    let mut widths: Vec<f32> = seg
+        .index
+        .visual
+        .subjects
+        .iter()
+        .filter(|b| (b.t_ms as f64) >= seg_start_ms && (b.t_ms as f64) < seg_end_ms)
+        .map(|b| b.w)
+        .collect();
+    widths.sort_by(f32::total_cmp);
+    let subject_inset = widths
+        .get(widths.len() / 2)
+        .is_some_and(|&w| w < crate::index::PIP_MAX_WIDTH);
+
     // Centre targets.
     let center_at = |k: usize| {
-        let (cx, cy) = seg.index.subject_center_at(t_ms(k)).unwrap_or((0.5, 0.5));
+        let (cx, cy) = if subject_inset {
+            (0.5, 0.5)
+        } else {
+            seg.index.subject_center_at(t_ms(k)).unwrap_or((0.5, 0.5))
+        };
         fr.clamp_center(cx, cy)
     };
     let (cx_t, cy_t): (Vec<f64>, Vec<f64>) = match p.track_settle_s {
@@ -236,15 +265,29 @@ pub fn solve_segment(seg: &SegmentCamera<'_>) -> CameraPath {
             let end_ms = t_ms(n);
             // Trigger slightly before the peak so the move lands on the emphasis.
             let lead_ms = 80.0;
+            // Only the file's strongest emphasis earns a punch-in: fast,
+            // animated speech produces a "peak" every half second.
+            let threshold = peak_threshold(&seg.index.audio.peaks, PUNCH_PEAK_PERCENTILE);
             let mut windows: Vec<(f64, f64)> = Vec::new();
-            for pk in &seg.index.audio.peaks {
+            for pk in seg
+                .index
+                .audio
+                .peaks
+                .iter()
+                .filter(|pk| pk.score >= threshold)
+            {
                 let t = pk.t_ms as f64 - lead_ms;
                 if t < start_ms || t >= end_ms {
                     continue;
                 }
                 let until = t + p.punch_hold_ms as f64;
                 match windows.last_mut() {
-                    Some(last) if t <= last.1 => last.1 = until,
+                    // Continuing emphasis extends the hold, up to a cap.
+                    Some(last) if t <= last.1 => {
+                        last.1 = until.min(last.0 + PUNCH_MAX_MS);
+                    }
+                    // Too soon after the last punch-in: skip, avoid a "breathing" camera.
+                    Some(last) if t < last.1 + PUNCH_COOLDOWN_MS => {}
                     _ => windows.push((t, until)),
                 }
             }
@@ -293,7 +336,25 @@ pub fn solve_segment(seg: &SegmentCamera<'_>) -> CameraPath {
         keyframes: compress(&frames, seg.tolerance_px),
         solved_frames: n as u32,
         punch_ins,
+        subject_inset,
     }
+}
+
+/// Peaks must reach this percentile of the file's peak scores to punch in.
+pub const PUNCH_PEAK_PERCENTILE: f64 = 0.85;
+/// Minimum gap between the end of one punch-in and the start of the next (ms).
+pub const PUNCH_COOLDOWN_MS: f64 = 1_500.0;
+/// Longest a single punch-in may be held (ms).
+pub const PUNCH_MAX_MS: f64 = 3_000.0;
+
+fn peak_threshold(peaks: &[crate::index::ExcitementPeak], q: f64) -> f32 {
+    if peaks.len() < 8 {
+        // Too few peaks for statistics: all of them count.
+        return f32::NEG_INFINITY;
+    }
+    let mut s: Vec<f32> = peaks.iter().map(|p| p.score).collect();
+    s.sort_by(f32::total_cmp);
+    s[((s.len() - 1) as f64 * q).round() as usize]
 }
 
 /// Ramer–Douglas–Peucker over time-parameterised keyframes using the L∞
@@ -399,9 +460,9 @@ mod tests {
     fn subject(t_ms: u64, cx: f32) -> SubjectBox {
         SubjectBox {
             t_ms,
-            x: cx - 0.05,
+            x: cx - 0.1,
             y: 0.3,
-            w: 0.1,
+            w: 0.2,
             h: 0.3,
             confidence: 0.9,
             source: SubjectSource::Saliency,
@@ -452,6 +513,49 @@ mod tests {
         assert!(end.x > start.x + 200.0, "{start:?} -> {end:?}");
         // Compressed path still has bounded error vs. a dense re-solve.
         assert!(path.keyframes.len() < 90);
+    }
+
+    #[test]
+    fn facecam_inset_is_not_tracked() {
+        // Regression (real reaction video): UltraFace found the 5%-wide
+        // facecam in the top-left corner; tracking it framed the corner and
+        // cropped away the content being discussed.
+        let inset = |t_ms| SubjectBox {
+            t_ms,
+            x: 0.02,
+            y: 0.03,
+            w: 0.055,
+            h: 0.1,
+            confidence: 0.9,
+            source: SubjectSource::Onnx,
+        };
+        let idx = index_with((0..30).map(|k| inset(k * 200)).collect(), vec![]);
+        let path = solve_segment(&seg(&idx, MotionPreset::SmoothTrackSubject, 180));
+        assert!(path.subject_inset);
+        assert_eq!(path.keyframes.len(), 1, "camera holds still");
+        let k = path.keyframes[0];
+        assert!((k.x + k.w / 2.0 - 960.0).abs() < 1e-6, "centred: {k:?}");
+    }
+
+    #[test]
+    fn punch_ins_need_strong_peaks_and_cooldown() {
+        // Regression (real commentary): 1.6 peaks/s made SpringPunchIn zoom
+        // almost continuously. Only top-15% peaks fire, with a cooldown.
+        let mut peaks: Vec<ExcitementPeak> = (0..40)
+            .map(|k| ExcitementPeak {
+                t_ms: 100 + k * 150,
+                score: 1.6,
+            })
+            .collect();
+        for (t, s) in [(1_000, 4.0), (1_600, 4.0), (2_900, 4.0), (5_000, 4.0)] {
+            peaks.push(ExcitementPeak { t_ms: t, score: s });
+        }
+        peaks.sort_by_key(|p| p.t_ms);
+        let idx = index_with(vec![], peaks);
+        let path = solve_segment(&seg(&idx, MotionPreset::SpringPunchIn, 210));
+        // 1000 opens a window (to 2020, extended by 1600 to 2620); 2900 is
+        // inside the 1.5 s cooldown; 5000 opens the second window.
+        assert_eq!(path.punch_ins, 2, "{path:?}");
     }
 
     #[test]
@@ -536,6 +640,7 @@ mod tests {
                 keyframes: compress(&frames, tol),
                 solved_frames: frames.len() as u32,
                 punch_ins: 0,
+                subject_inset: false,
             };
             for f in &frames {
                 let s = path.sample(f.t_us).unwrap();

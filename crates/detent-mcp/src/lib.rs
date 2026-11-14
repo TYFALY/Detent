@@ -38,7 +38,7 @@ detent turns long talking-head / screen recordings into tight, human-feeling edi
 Workflow:
 1. index_media(path) → read `digest.phrases` (what is said, with ms timings), \
 `digest.cut_windows` (pauses where cuts sound natural), `digest.excitement_ms` (vocal emphasis) \
-and `digest.shots_ms`. Look at the contact sheet image to judge framing.
+and `digest.shots_ms`. Look at the contact sheet image to judge framing. If `digest.framing_hint` is `PipFacecam` (a small facecam over screen/game content), set `output.layout` to `FitBlur` so the content is not cropped away; use `Crop` for talking heads.
 2. Optionally inspect_keyframes(index_path, start_ms, end_ms) to verify a moment visually.
 3. solve_and_validate_edl(index_path, edl): choose clips by meaning (hook first), express camera \
 and audio intent only via presets. Cut points may be approximate: the solver snaps them into breath \

@@ -28,12 +28,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::camera::{Framing, SegmentCamera, solve_segment};
 use crate::captions::{TimedWord, chunk};
-use crate::edl::{MIN_CLIP_MS, MotionPreset, SemanticEdl, TransitionKind};
+use crate::edl::{MIN_CLIP_MS, MotionPreset, OutputLayout, SemanticEdl, TransitionKind};
 use crate::error::{CoreError, Result, ValidationIssue};
 use crate::index::{MediaIndex, PauseKind};
 use crate::time::{FrameRate, US_PER_MS, UsRange, ms_to_us, us_to_ms};
 use crate::timeline::{
-    FrameRange, OutputFormat, ResolvedCaptions, ResolvedSegment, ResolvedTimeline, Splice,
+    FrameRange, Layout, OutputFormat, ResolvedCaptions, ResolvedSegment, ResolvedTimeline, Splice,
     TIMELINE_VERSION, TimelineSource,
 };
 
@@ -58,6 +58,10 @@ pub struct SolverConfig {
     pub caption_linger_ms: u32,
     /// Extra cost (ms-equivalent) for snapping to a breath instead of silence.
     pub breath_penalty_ms: u32,
+    /// Max distance a cut inside a word may move to reach a word boundary (ms).
+    pub word_snap_max_ms: u32,
+    /// ASR word-edge uncertainty: overlaps up to this long are not "speech" (ms).
+    pub word_edge_tolerance_ms: u32,
 }
 
 impl Default for SolverConfig {
@@ -72,6 +76,8 @@ impl Default for SolverConfig {
             camera_tolerance_px: 0.25,
             caption_linger_ms: 250,
             breath_penalty_ms: 30,
+            word_snap_max_ms: 350,
+            word_edge_tolerance_ms: 60,
         }
     }
 }
@@ -348,7 +354,7 @@ impl EdlSolver {
                     "jl_downgraded",
                     Some(k),
                     format!(
-                        "{kind:?} after clip {k} downgraded to Hard: no speech-free {}-{target_ms} ms window on both sides of the splice",
+                        "{kind:?} after clip {k} downgraded to Hard: speech is continuous on both sides of the splice (no speech-free {}-{target_ms} ms window); a micro-crossfade is still applied",
                         crate::edl::JL_OFFSET_RANGE_MS.start()
                     ),
                 ),
@@ -420,10 +426,26 @@ impl EdlSolver {
                 (even(f64::from(h) * src_w / src_h), h)
             }
         };
+        // FitBlur shows the whole source frame (source aspect) full-width over
+        // a blurred fill; the camera then works on source-aspect windows.
+        let layout = match edl.output.layout {
+            OutputLayout::Crop => Layout::Crop,
+            OutputLayout::FitBlur => Layout::FitBlur {
+                fg_width: out_w,
+                fg_height: even(f64::from(out_w) * src_h / src_w).min(out_h),
+            },
+        };
+        let (pic_w, pic_h) = match layout {
+            Layout::Crop => (out_w, out_h),
+            Layout::FitBlur {
+                fg_width,
+                fg_height,
+            } => (fg_width, fg_height),
+        };
         let framing = Framing {
             src_w,
             src_h,
-            aspect: f64::from(out_w) / f64::from(out_h),
+            aspect: f64::from(pic_w) / f64::from(pic_h),
         };
 
         // 6. Segments + camera.
@@ -458,6 +480,17 @@ impl EdlSolver {
                         Some(i),
                         "SpringPunchIn requested but no vocal excitement peaks fall in this clip"
                             .into(),
+                    );
+                }
+                if camera.subject_inset && preset == MotionPreset::SmoothTrackSubject {
+                    rep.diag(
+                        Level::Warning,
+                        "subject_is_inset",
+                        Some(i),
+                        format!(
+                            "the detected subject is a small picture-in-picture inset (facecam over content);                              it was not tracked. For screen/gameplay/reaction footage use \"output\": {{\"layout\": \"FitBlur\"}}{}",
+                            if edl.output.layout == OutputLayout::FitBlur { " (already active)" } else { "" }
+                        ),
                     );
                 }
                 if preset == MotionPreset::SmoothTrackSubject && index.visual.subjects.is_empty() {
@@ -565,6 +598,7 @@ impl EdlSolver {
                 }
             }
         }
+        let edge_tol = ms_to_us(u64::from(self.config.word_edge_tolerance_ms));
         for (i, (v, a)) in video_ranges.iter().zip(&audio).enumerate() {
             let speech_in = a.start_us
                 + if i > 0 {
@@ -574,11 +608,7 @@ impl EdlSolver {
                 };
             let speech_out = a.end_us - splices.get(i).map_or(0, |s| s.crossfade_us / 2);
             for (edge, t) in [(Edge::In, speech_in), (Edge::Out, speech_out)] {
-                if let Some(w) = index
-                    .transcript
-                    .iter()
-                    .find(|w| ms_to_us(w.start_ms) < t && t < ms_to_us(w.end_ms))
-                {
+                if let Some(w) = index.word_containing(t, edge_tol) {
                     rep.diag(
                         Level::Warning,
                         "cut_inside_word",
@@ -616,6 +646,7 @@ impl EdlSolver {
                 width: out_w,
                 height: out_h,
                 fps,
+                layout,
             },
             segments,
             splices,
@@ -664,7 +695,13 @@ impl EdlSolver {
                 to_ms: us_to_ms(to),
             });
             cut.us = to;
-        } else if !index.audio.pauses.is_empty() || !index.transcript.is_empty() {
+        } else if index
+            .word_containing(t, ms_to_us(u64::from(self.config.word_edge_tolerance_ms)))
+            .is_some()
+            || (index.transcript.is_empty() && !index.audio.pauses.is_empty())
+        {
+            // Only worth reporting when the cut is genuinely mid-word (or there
+            // is no transcript to say otherwise); a word-boundary cut is fine.
             rep.diag(
                 Level::Info,
                 "no_valley",
@@ -688,11 +725,14 @@ impl EdlSolver {
             .min_by_key(|(_, su)| (su - cut.us).abs());
         if let Some((shot, su)) = nearest {
             let region = UsRange::new(su.min(cut.us), su.max(cut.us));
+            // A 1-4 frame flash is a worse defect than trimming the padded edge
+            // of an ASR word, so overlaps within the word-edge tolerance are allowed.
+            let edge_tol = ms_to_us(u64::from(self.config.word_edge_tolerance_ms));
             let safe = region.len_us() < fps.frame_duration_us()
                 || if index.transcript.is_empty() {
-                    index.inside_pause(region)
+                    index.inside_pause(region) || region.len_us() <= edge_tol
                 } else {
-                    !index.words_overlap(region, 0)
+                    index.speech_overlap_us(region) <= edge_tol
                 };
             if safe {
                 if region.len_us() > 0 {
@@ -761,26 +801,35 @@ impl EdlSolver {
         best.map(|(_, c, k, db)| (c, k, db))
     }
 
-    /// Nearest inter-word gap when `t` falls inside a word.
+    /// When `t` falls inside a word, moves it to that word's nearer edge (or
+    /// into the adjacent inter-word gap), then refines to the quietest 10 ms
+    /// hop within ±40 ms: fast speech has no pauses, but it always has word
+    /// boundaries, and the true boundary is where the energy dips.
     fn word_gap_snap(&self, index: &MediaIndex, t: i64) -> Option<i64> {
+        let w = index.word_containing(t, 0)?;
+        let (s, e) = (ms_to_us(w.start_ms), ms_to_us(w.end_ms));
+        let max = ms_to_us(u64::from(self.config.word_snap_max_ms));
         let words = &index.transcript;
-        if words.is_empty() || !index.words_overlap(UsRange::new(t, t + 1), 0) {
+        let i = words.iter().position(|x| std::ptr::eq(x, w))?;
+        // Edge, or the middle of a real gap next to that edge.
+        let before = match i.checked_sub(1).and_then(|j| words.get(j)) {
+            Some(p) if ms_to_us(p.end_ms) < s => (ms_to_us(p.end_ms) + s) / 2,
+            _ => s,
+        };
+        let after = match words.get(i + 1) {
+            Some(n) if ms_to_us(n.start_ms) > e => (e + ms_to_us(n.start_ms)) / 2,
+            _ => e,
+        };
+        let c = if (t - before).abs() <= (after - t).abs() {
+            before
+        } else {
+            after
+        };
+        if (c - t).abs() > max {
             return None;
         }
-        let tol = ms_to_us(u64::from(self.config.snap_tolerance_ms));
-        let mut gaps = Vec::with_capacity(words.len() + 1);
-        gaps.push((0, ms_to_us(words[0].start_ms)));
-        for w in words.windows(2) {
-            gaps.push((ms_to_us(w[0].end_ms), ms_to_us(w[1].start_ms)));
-        }
-        if let Some(last) = words.last() {
-            gaps.push((ms_to_us(last.end_ms), index.duration_us()));
-        }
-        gaps.into_iter()
-            .filter(|(a, b)| b > a)
-            .map(|(a, b)| (a + b) / 2)
-            .filter(|c| (c - t).abs() <= tol)
-            .min_by_key(|c| (c - t).abs())
+        const REFINE_US: i64 = 40_000;
+        Some(index.quietest_in(c - REFINE_US, c + REFINE_US).unwrap_or(c))
     }
 
     /// Nearest frame, preferring the neighbour that does not clip a word.

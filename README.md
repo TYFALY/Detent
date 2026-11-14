@@ -51,6 +51,10 @@ flowchart LR
 
 Requires Rust ≥ 1.88 and FFmpeg/ffprobe on `PATH` (or set `DETENT_FFMPEG` / `DETENT_FFPROBE`).
 
+### Without ML models
+
+Everything below is pure Rust plus FFmpeg. Subject framing uses the built-in saliency heuristic, and word timings come from a transcript you import.
+
 ```bash
 cargo install --path crates/detent-cli
 ```
@@ -67,30 +71,38 @@ detent solve talk.mp4.detent/index.json examples/edl.json
 detent render talk.mp4.detent/timeline.json -o short.mp4 --preview
 ```
 
-`detent index` writes `index.json` and `grid.jpg` into `talk.mp4.detent/`. A transcript is optional but strongly recommended, because the solver protects words. There are three ways to get one:
+`detent index` writes `index.json` and `grid.jpg` into `talk.mp4.detent/`. The transcript can be detent's own `[{word,start_ms,end_ms,confidence}]` JSON or the WhisperX / faster-whisper `segments[].words[]` layout. A transcript is optional, but strongly recommended, because the solver protects words.
 
-- **Local, any OS, no compiler.** Download a prebuilt [`whisper-cli`](https://github.com/ggml-org/whisper.cpp/releases) and a ggml model, then run `detent index talk.mp4 --whisper-model ggml-base.en.bin`. Point `DETENT_WHISPER_CLI` at the binary if it is not on `PATH`; set `DETENT_WHISPER_MODEL` to make the model the default, including for the MCP server.
-- **Native.** Build with `--features whisper` to link whisper.cpp through `whisper-rs` (needs CMake, a C++ compiler and libclang; MSVC on Windows).
-- **Import.** Pass `--transcript words.json` in detent's own format or the WhisperX / faster-whisper `segments[].words[]` layout.
+### With local ML models (no C++ toolchain needed)
 
-Raw whisper word timestamps are often several hundred milliseconds off and stretch words across the silence that follows them. detent re-times them against the acoustic pauses before the solver sees them; see *Word re-timing* below.
+1. **Speech.** Download a prebuilt `whisper-cli` from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) and a ggml model such as `ggml-base.en.bin`.
+2. **Faces.** Build with `--features onnx`, then download [ONNX Runtime](https://github.com/microsoft/onnxruntime/releases) 1.24+ and the UltraFace model `version-RFB-320.onnx`.
+3. Point detent at them:
 
-`detent solve` prints every cut it resolved, every automatic adjustment, and every request it could not honour. Here is real output for [`examples/edl.json`](examples/edl.json) against the 10-minute benchmark file, which has no transcript:
+```bash
+export DETENT_WHISPER_CLI=/path/to/whisper-cli DETENT_WHISPER_MODEL=/path/to/ggml-base.en.bin
+```
+
+```bash
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so DETENT_FACE_MODEL=/path/to/version-RFB-320.onnx
+```
+
+```bash
+detent index talk.mp4
+```
+
+The same variables configure the MCP server. On Linux or macOS with CMake and libclang, `--features whisper` links whisper.cpp natively instead of using the subprocess.
+
+`detent solve` prints every cut it resolved, every automatic adjustment, and every request it could not honour. Here is real output from the edit described in *Real-footage results* below:
 
 ```text
-$ detent solve bench.mp4.detent/index.json examples/edl.json
-  ✗ /captions: captions requested but the index has no transcript
-Error: EDL rejected with 1 issue(s)
-
-$ detent solve bench.mp4.detent/index.json edl_without_captions.json
-solved 3 clip(s) → 1080x1920@30.000 (30.00s), 3 adjustment(s)
-  clip 0: requested 312400-319900 ms → video 312400-319900 ms (frames 9372-9597), at 0 ms
-  clip 1: requested 41200-52800 ms → video 41200-52800 ms (frames 1236-1584), at 7500 ms
-  clip 2: requested 330100-341000 ms → video 330100-341000 ms (frames 9903-10230), at 19100 ms
-  [info] no_valley: no breath/silence valley within ±120 ms of the In-point at 312400 ms
-  …
-  [warn] scene_collision: In-point at 330100 ms is 100 ms from a shot change at 330000 ms, but moving it would cut speech; a brief flash may be visible
-  [warn] jl_downgraded: AutoJCut after clip 0 downgraded to Hard: no speech-free 150-220 ms window on both sides of the splice
+solved 5 clip(s) → 1080x1920@60.000 (45.18s), 7 adjustment(s)
+  clip 0: requested 60-15240 ms → video 50-15183 ms (frames 3-911), at 0 ms
+  clip 1: requested 16603-22376 ms → video 16550-22383 ms (frames 993-1343), at 15133 ms
+  clip 2: requested 47538-56707 ms → video 47533-56717 ms (frames 2852-3403), at 20967 ms
+  clip 3: requested 78378-86663 ms → video 78383-86667 ms (frames 4703-5200), at 30150 ms
+  clip 4: requested 99012-105784 ms → video 99017-105767 ms (frames 5941-6346), at 38433 ms
+  [warn] jl_downgraded: AutoJCut after clip 0 downgraded to Hard: speech is continuous on both sides of the splice (no speech-free 150-200 ms window); a micro-crossfade is still applied
 ```
 
 `detent schema edl` prints the JSON Schema the model is held to.
@@ -113,7 +125,7 @@ For Claude Desktop, add this to `claude_desktop_config.json`:
 
 | Tool | Input | Returns |
 |---|---|---|
-| `index_media` | `path`, optional `transcript_json`, `out_dir` | `index_path`, a bounded **digest** (phrases with ms timings, natural cut windows, emphasis peaks, shot changes, a 240-point loudness curve), and the contact sheet as an image |
+| `index_media` | `path`, optional `transcript_json`, `whisper_model`, `language`, `out_dir` | `index_path`, a bounded **digest** (sentence-level phrases with ms timings, natural cut windows, emphasis peaks, shot changes, a 240-point loudness curve, and a `framing_hint` such as `PipFacecam`), and the contact sheet as an image |
 | `inspect_keyframes` | `index_path`, `start_ms`, `end_ms`, grid size | a timestamped JPEG grid for that range |
 | `solve_and_validate_edl` | `index_path`, `edl` (`SemanticEdl`) | `timeline_path`, frame-exact cut list, adjustments, diagnostics; or **all** validation issues as JSON pointers |
 | `render_timeline` | `resolved_timeline_path`, `output_path`, `quality`, `mode`, `encoder` | encoder used, frames, fps, realtime factor |
@@ -137,7 +149,7 @@ The digest is sized by `DigestLimits`, so a two-hour file costs the model about 
 }
 ```
 
-Motion presets are `None`, `SpringPunchIn`, `SmoothTrackSubject` and `SlowCreep`. Transitions are `Hard`, `AutoJCut` and `AutoLCut` (offset 150–300 ms). Caption styles are `BoldPop`, `Minimal` and `Karaoke`.
+Motion presets are `None`, `SpringPunchIn`, `SmoothTrackSubject` and `SlowCreep`. Transitions are `Hard`, `AutoJCut` and `AutoLCut` (offset 150–300 ms). Caption styles are `BoldPop`, `Minimal` and `Karaoke`. `output.layout` is `Crop` (camera crops a 9:16 window; for talking heads) or `FitBlur` (the full 16:9 frame over a blurred fill; for screen, gameplay and reaction footage, where cropping would discard the content).
 
 ## The solver: math and invariants
 
@@ -190,6 +202,31 @@ whisper.cpp's per-word timestamps tend to swallow pauses. In one test narration 
 2. Within each speech island between matched pauses, the whisper times are mapped affinely onto the island's acoustic extent. Word order and relative durations are kept.
 
 On that narration this left 0 of 15 pauses covered and turned 1 run-on "phrase" into the 10 real phrases. This pass runs only for raw ASR output; imported transcripts from forced aligners are left as they are.
+
+## Real-footage results
+
+The pipeline was tested end to end through the MCP tools on a real 8 min 41 s commentary video (AV1 1080p60, stereo AAC). It is a reaction-style upload: a small facecam over browser screenshots and price charts, with a fast talker over background audio. The model picked a five-clip, 45 s market-crash story with `SpringPunchIn` on emphasis and `FitBlur` framing.
+
+| Stage | Result |
+|---|---|
+| `index_media` (AV1 decode → DSP, shots, UltraFace subjects, contact sheet, `whisper-cli` base.en ASR, word re-timing) | 521 s of media in **49.8 s (10.5x realtime)**: 1,632 words, 85 shots, 1,299 face boxes |
+| `solve_and_validate_edl` | **< 10 ms**: 0 cuts inside words, 0 scene collisions (3 snapped onto the source's own cuts), 5 punch-ins |
+| `render_timeline` (1080×1920@60, FitBlur, spring camera, captions, `h264_nvenc`) | 45.2 s output in **11.5 s (3.9x realtime, 236 fps)**; exactly 2,711 frames, audio and video both 45.183 s |
+| Splice audit | largest sample jump at any splice is 0.02–0.55x the track's normal 99.9th percentile: no clicks |
+
+The first attempt exposed every problem listed in the next section; each was fixed at the root with a regression test.
+
+## Engineering & edge cases solved
+
+- **Whisper timestamp drift (acoustic re-timing).** Raw whisper.cpp words stretch across the following silence; in a test narration they covered 15 of 15 pauses. A monotonic DP matches pauses to word boundaries, then each speech island is re-timed affinely. Result: 0 of 15 covered. See *Word re-timing*.
+- **Cuts inside back-to-back words.** In fast speech whisper emits zero-gap words and there are no pauses, so the first real edit put 8 of 10 cuts mid-word. Cuts now snap to the nearer word edge (≤ 350 ms), refined to the quietest 10 ms hop within ±40 ms.
+- **Flash frames vs. padded word edges.** The source's own edits sat 17–50 ms from sentence ends. The scene guard used to refuse those moves to protect the padded tail of an ASR word, which left a 1–3 frame flash. It now trims up to 60 ms of word edge, which is ASR uncertainty, never real speech.
+- **FFmpeg expression depth limit.** FFmpeg silently drops frames once a flat sum exceeds about 100 terms. Camera paths compile to hinge sums in a balanced tree, O(log n) deep, tested at 1,500 terms. Renders also fail if the frame count differs from the timeline's.
+- **Facecam insets.** UltraFace correctly found the streamer's face, but it was a 5%-wide picture-in-picture box in a corner, and tracking it would crop away the content. Boxes under 12% of frame width are treated as insets: they are not tracked, the digest reports `framing_hint: PipFacecam`, and the `FitBlur` layout shows the full frame.
+- **Subject hysteresis in crowds.** One primary face is chosen by `confidence × √area`; another face replaces it only if it is 1.5x more prominent, so the camera does not hop between people (42 faces in a group photo).
+- **Over-eager punch-ins.** Animated speech produced 1.6 "peaks" per second, so the camera zoomed almost constantly. Punch-ins now need a top-15% peak and respect a 1.5 s cooldown and a 3 s hold cap, at 1.06 / 1.10 / 1.15x for Subtle / Medium / Strong.
+- **Caption line breaks.** Real speech produced "AT 3 / CENTS", "HIGH OF 26 / DOLLARS" and "THE HIGHEST IT / WAS". Numbers (digits and words), subject pronouns and determiners like "such" now bind to the next word.
+- **Unreadable digests.** A fast talker produced one 8-minute "phrase". Phrases now also split at sentence ends and every 25 words: 195 phrases.
 
 ## Engineering properties
 
@@ -271,6 +308,8 @@ Tests that need FFmpeg skip with a message when it is not installed. CI runs `fm
 - The shot detector finds hard cuts, not dissolves or fades.
 - The native `whisper` feature does not build with the `x86_64-pc-windows-gnu` toolchain (whisper-rs passes the MSVC-only `/utf-8` flag to MinGW). The default `whisper-cli` path works there.
 - The renderer opens one FFmpeg input per segment (two with audio). That keeps memory bounded, but very long EDLs (hundreds of clips) are better rendered in batches.
+
+- J/L cuts need speech-free audio on both sides of a splice. In continuous speech the solver honestly downgrades them to hard cuts with a micro-crossfade rather than leaking a neighbouring word.
 
 ## License
 
