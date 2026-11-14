@@ -1,0 +1,34 @@
+[package]
+name = "detent-cli"
+description = "The `detent` command-line tool: index, solve, render, serve MCP, benchmark."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "detent"
+path = "src/main.rs"
+
+[features]
+default = []
+whisper = ["detent-indexer/whisper"]
+onnx = ["detent-indexer/onnx"]
+
+[dependencies]
+detent-core.workspace = true
+detent-indexer = { workspace = true, features = ["dsp", "ffmpeg-cli"] }
+detent-renderer.workspace = true
+detent-mcp.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "detent-renderer"
+description = "Compiles a resolved detent timeline into a deterministic FFmpeg filtergraph and executes it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+detent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+detent-indexer = { workspace = true, features = ["dsp", "ffmpeg-cli"] }
+
+[lints]
+workspace = true

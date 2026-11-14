@@ -1,0 +1,21 @@
+{
+  "clips": [
+    { "start_ms": 312400, "end_ms": 319900, "hook_score": 0.92,
+      "editorial_note": "Counter-intuitive claim; strongest opening line." },
+    { "start_ms": 41200, "end_ms": 52800, "hook_score": 0.55,
+      "editorial_note": "Context the claim depends on." },
+    { "start_ms": 330100, "end_ms": 341000, "hook_score": 0.61,
+      "editorial_note": "Payoff with on-camera demo." }
+  ],
+  "motion_cues": [
+    { "clip": 0, "preset": "SpringPunchIn", "intensity": "Strong" },
+    { "clip": 1, "preset": "SmoothTrackSubject" },
+    { "clip": 2, "preset": "SlowCreep", "intensity": "Subtle" }
+  ],
+  "audio_transitions": [
+    { "after_clip": 0, "kind": "AutoJCut", "offset_ms": 220 },
+    { "after_clip": 1, "kind": "AutoLCut" }
+  ],
+  "captions": { "style": "BoldPop", "position": "Lower" },
+  "output": { "aspect": "Vertical9x16", "height": 1920 }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "detent-core"
+description = "Domain types, Semantic EDL schema, audio DSP and the deterministic EDL solver for detent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+rustfft.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "core"
+harness = false
+
+[lints]
+workspace = true

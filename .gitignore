@@ -1,0 +1,7 @@
+/target
+*.detent/
+/out/
+*.mp4
+*.mov
+*.wav
+!/fixtures/**

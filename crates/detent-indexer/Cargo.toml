@@ -1,0 +1,40 @@
+[package]
+name = "detent-indexer"
+description = "Single-pass multi-modal media indexing (audio DSP, shots, saliency, contact sheets, speech) for detent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["dsp", "ffmpeg-cli"]
+# Pure-Rust audio analysis (always cheap; kept as a feature so the matrix is explicit).
+dsp = []
+# Decode media by streaming raw PCM / frames out of an `ffmpeg` child process.
+ffmpeg-cli = []
+# Word-level speech recognition via whisper.cpp (needs cmake + a C++ toolchain + clang for bindgen).
+whisper = ["dep:whisper-rs"]
+# ONNX Runtime face / subject detection.
+onnx = ["dep:ort"]
+
+[dependencies]
+detent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+image.workspace = true
+tracing.workspace = true
+whisper-rs = { version = "0.16", optional = true }
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "load-dynamic", "api-24"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "indexer"
+harness = false
+
+[lints]
+workspace = true
