@@ -263,11 +263,11 @@ Tests that need FFmpeg skip with a message when it is not installed. CI runs `fm
 | `dsp` | yes | Pure-Rust audio analysis |
 | `ffmpeg-cli` | yes | Streaming decoders over an `ffmpeg` child process |
 | `whisper` | no | Native `whisper-rs` (whisper.cpp) ASR, streamed in ≤ 28 s windows cut at the quietest point. Without it, `--whisper-model` runs a prebuilt `whisper-cli` subprocess instead |
-| `onnx` | no | `ort` UltraFace face detector, using ONNX Runtime loaded dynamically (`ORT_DYLIB_PATH`) |
+| `onnx` | no | UltraFace face detection through `ort`, with ONNX Runtime loaded at run time (`ORT_DYLIB_PATH`). Set `DETENT_FACE_MODEL=version-RFB-320.onnx` to use it; frames are letterboxed (no distortion), deduplicated with NMS, and one primary subject is chosen with hysteresis so the camera does not hop between faces in a crowd |
 
 ## Limitations
 
-- The default subject tracker is a heuristic (motion energy, YCbCr skin prior and centre bias). It works for single-subject footage. Use `onnx` for real face detection.
+- The default subject tracker is a heuristic (motion energy, YCbCr skin prior and centre bias). It works for single-subject footage. Use `onnx` for real face detection; against ONNX Runtime 1.24.4 it found 42 faces in a ~50-person group photo, and the gated `onnx_faces` test checks box sanity and subject stability on real photos.
 - The shot detector finds hard cuts, not dissolves or fades.
 - The native `whisper` feature does not build with the `x86_64-pc-windows-gnu` toolchain (whisper-rs passes the MSVC-only `/utf-8` flag to MinGW). The default `whisper-cli` path works there.
 - The renderer opens one FFmpeg input per segment (two with audio). That keeps memory bounded, but very long EDLs (hundreds of clips) are better rendered in batches.

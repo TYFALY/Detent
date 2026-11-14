@@ -19,8 +19,8 @@ use detent_core::index::{DigestLimits, IndexDigest};
 use detent_core::{CoreError, EdlSolver, MediaIndex, ResolvedTimeline, SemanticEdl, SolveReport};
 use detent_indexer::ffmpeg::FfmpegTools;
 use detent_indexer::{
-    IndexOptions, IndexStats, NoTranscript, SaliencyTracker, StaticTranscript, Transcriber,
-    WhisperCli, WhisperCliConfig,
+    IndexOptions, IndexStats, NoTranscript, SaliencyTracker, StaticTranscript, SubjectDetector,
+    Transcriber, WhisperCli, WhisperCliConfig,
 };
 use detent_renderer::{
     Encoder, EncoderChoice, Quality, RenderMetrics, RenderMode, RenderOptions, Renderer, Tools,
@@ -274,6 +274,19 @@ pub fn default_out_dir(media: &Path) -> PathBuf {
     media.with_file_name(name)
 }
 
+/// Subject detector + analysis frame width. With the `onnx` feature and
+/// `DETENT_FACE_MODEL` set (plus `ORT_DYLIB_PATH` for ONNX Runtime), uses the
+/// UltraFace detector on 320 px frames; otherwise the saliency heuristic on
+/// 160 px frames.
+pub fn make_detector() -> anyhow::Result<(Box<dyn SubjectDetector>, u32)> {
+    #[cfg(feature = "onnx")]
+    if let Some(model) = std::env::var_os("DETENT_FACE_MODEL") {
+        let det = detent_indexer::onnx::OnnxFaceDetector::new(Path::new(&model), 0.7, 200)?;
+        return Ok((Box::new(det), 320));
+    }
+    Ok((Box::new(SaliencyTracker::new(200)), 160))
+}
+
 /// Blocking implementation of `index_media`, shared with the CLI.
 pub fn index_media_blocking(
     tools: &FfmpegTools,
@@ -282,17 +295,13 @@ pub fn index_media_blocking(
     transcriber: &mut dyn Transcriber,
 ) -> anyhow::Result<IndexMediaResult> {
     std::fs::create_dir_all(out_dir)?;
+    let (mut detector, analysis_width) = make_detector()?;
     let opts = IndexOptions {
         contact_sheet_path: Some(out_dir.join("grid.jpg")),
+        analysis_width,
         ..IndexOptions::default()
     };
-    let indexed = detent_indexer::index_file(
-        tools,
-        path,
-        transcriber,
-        &mut SaliencyTracker::new(200),
-        &opts,
-    )?;
+    let indexed = detent_indexer::index_file(tools, path, transcriber, detector.as_mut(), &opts)?;
     let index_path = out_dir.join("index.json");
     std::fs::write(&index_path, serde_json::to_vec(&indexed.index)?)?;
     Ok(IndexMediaResult {
