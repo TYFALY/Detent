@@ -288,31 +288,73 @@ pub fn to_ass(
     )
 }
 
-/// Splits a headline into balanced lines of about 22 chars, honouring
-/// explicit `\n` breaks.
+/// Splits a headline into lines. Explicit `\n` breaks are kept as written;
+/// otherwise the text is split into the fewest lines of at most ~26 chars,
+/// with the break points chosen so the lines are as even as possible.
 fn wrap_headline(text: &str) -> String {
-    const MAX: usize = 22;
-    let mut lines: Vec<String> = Vec::new();
-    for para in text.split('\n') {
-        let mut cur = String::new();
-        for w in para.split_whitespace() {
-            if !cur.is_empty() && cur.chars().count() + 1 + w.chars().count() > MAX {
-                lines.push(std::mem::take(&mut cur));
-            }
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(w);
-        }
-        if !cur.is_empty() {
-            lines.push(cur);
-        }
-    }
+    const MAX: usize = 26;
+    let lines: Vec<String> = if text.contains('\n') {
+        text.split('\n')
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|l| !l.is_empty())
+            .collect()
+    } else {
+        balance_lines(&text.split_whitespace().collect::<Vec<_>>(), MAX)
+    };
     lines
         .iter()
         .map(|l| sanitize(l))
         .collect::<Vec<_>>()
         .join(r"\N")
+}
+
+/// Splits `words` into the fewest lines that fit `max` chars (a single long
+/// word may overflow), minimising the longest line.
+fn balance_lines(words: &[&str], max: usize) -> Vec<String> {
+    let n = words.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let width = |i: usize, j: usize| -> usize {
+        words[i..j].iter().map(|w| w.chars().count()).sum::<usize>() + (j - i - 1)
+    };
+    let total = width(0, n);
+    let mut lines_needed = total.div_ceil(max).clamp(1, n);
+    loop {
+        // best[k][j]: minimal longest line splitting words[..j] into k lines.
+        let inf = usize::MAX;
+        let mut best = vec![vec![inf; n + 1]; lines_needed + 1];
+        let mut cut = vec![vec![0usize; n + 1]; lines_needed + 1];
+        best[0][0] = 0;
+        for k in 1..=lines_needed {
+            for j in 1..=n {
+                for i in (k - 1)..j {
+                    if best[k - 1][i] == inf {
+                        continue;
+                    }
+                    let v = best[k - 1][i].max(width(i, j));
+                    if v < best[k][j] {
+                        best[k][j] = v;
+                        cut[k][j] = i;
+                    }
+                }
+            }
+        }
+        let longest_word = words.iter().map(|w| w.chars().count()).max().unwrap_or(0);
+        if best[lines_needed][n] <= max.max(longest_word) || lines_needed >= n {
+            let mut out = Vec::with_capacity(lines_needed);
+            let (mut k, mut j) = (lines_needed, n);
+            while k > 0 {
+                let i = cut[k][j];
+                out.push(words[i..j].join(" "));
+                j = i;
+                k -= 1;
+            }
+            out.reverse();
+            return out;
+        }
+        lines_needed += 1;
+    }
 }
 
 /// Like [`to_ass`], plus a pinned headline and highlighted words.
@@ -393,7 +435,7 @@ pub fn to_ass_with(
     out.pop();
     out.push_str(&format!(
         "Style: Headline,Arial Black,{:.0},&H00000000,&H00000000,&H00FFFFFF,&H00FFFFFF,-1,0,0,0,100,100,0,0,3,{:.1},0,8,{m},{m},{:.0},1\n\n",
-        h * 0.034,
+        h * 0.040,
         h * 0.011,
         h * 0.112,
         m = (f64::from(width) * 0.08).round(),
@@ -614,6 +656,25 @@ mod tests {
         assert!(maps.contains("&H5CFF39&"));
         let two = doc.lines().find(|l| l.ends_with("TWO")).unwrap();
         assert!(!two.contains("&H5CFF39&"));
+    }
+
+    #[test]
+    fn headline_wrapping() {
+        // Explicit breaks are kept even when a line is long.
+        assert_eq!(
+            wrap_headline("Rogue operators are raiding\nNorth Korea's black site"),
+            r"Rogue operators are raiding\NNorth Korea's black site"
+        );
+        // Otherwise lines are balanced, not greedily filled.
+        assert_eq!(
+            wrap_headline("Warzone just dropped a map set in Korea"),
+            r"Warzone just dropped\Na map set in Korea"
+        );
+        assert_eq!(wrap_headline("Short hook"), "Short hook");
+        assert_eq!(
+            wrap_headline("Supercalifragilisticexpialidocious!!"),
+            "Supercalifragilisticexpialidocious!!"
+        );
     }
 
     #[test]
