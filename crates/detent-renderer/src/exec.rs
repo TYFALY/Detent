@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use detent_core::ResolvedTimeline;
-use detent_core::captions::to_ass;
+use detent_core::captions::{AssExtras, to_ass_with};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -134,12 +134,17 @@ impl Renderer {
             .map_err(io_err(Path::new("temp dir")))?;
         let ass = match &t.captions {
             Some(c) if !c.blocks.is_empty() => {
-                let doc = to_ass(
+                let doc = to_ass_with(
                     &c.blocks,
                     c.style,
                     c.position,
                     t.output.width,
                     t.output.height,
+                    &AssExtras {
+                        headline: c.headline.as_deref(),
+                        highlight_words: &c.highlight_words,
+                        duration_us: t.duration_us,
+                    },
                 );
                 let p = work.path().join("captions.ass");
                 std::fs::write(&p, doc).map_err(io_err(&p))?;

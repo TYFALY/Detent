@@ -88,6 +88,8 @@ fn edl(clips: Vec<EdlClip>) -> SemanticEdl {
         motion_cues: vec![],
         audio_transitions: vec![],
         captions: None,
+        headline: None,
+        highlight_words: Vec::new(),
         output: OutputSpec::default(),
     }
 }
@@ -604,6 +606,8 @@ fn arb_scenario() -> impl Strategy<Value = Scenario> {
                             motion_cues,
                             audio_transitions,
                             captions: (caps && has_words).then(CaptionSpec::default),
+                            headline: None,
+                            highlight_words: Vec::new(),
                             output: OutputSpec {
                                 aspect,
                                 height: 1920,

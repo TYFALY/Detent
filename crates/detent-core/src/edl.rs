@@ -35,6 +35,16 @@ pub struct SemanticEdl {
     /// Burned-in caption settings. Omit for no captions.
     #[serde(default)]
     pub captions: Option<CaptionSpec>,
+    /// A short hook headline pinned to the top of the frame for the whole
+    /// video (white box, black text), e.g. "Agust D's song in the new Warzone
+    /// trailer". Requires `captions`. A newline forces a line break.
+    #[serde(default)]
+    #[schemars(length(max = 90))]
+    pub headline: Option<String>,
+    /// Caption words to emphasise (case-insensitive, punctuation ignored).
+    /// `WordBounce` renders them green and slightly larger.
+    #[serde(default)]
+    pub highlight_words: Vec<String>,
     /// Output framing.
     #[serde(default)]
     pub output: OutputSpec,
@@ -133,6 +143,9 @@ pub enum CaptionStyle {
     Minimal,
     /// Word-by-word highlight synced to speech.
     Karaoke,
+    /// One word at a time in heavy yellow with a thick black stroke; each word
+    /// lands with a small overshoot bounce.
+    WordBounce,
 }
 
 /// Vertical caption placement.
@@ -242,6 +255,11 @@ pub enum OutputLayout {
     /// reaction videos with a facecam inset, where cropping would discard the
     /// content. Captions sit in the lower blurred band.
     FitBlur,
+    /// Like `FitBlur`, but the foreground is a taller 4:5 window cropped from
+    /// the source (the camera still tracks inside it), so the picture fills
+    /// about 70% of a 9:16 frame instead of a thin strip. Best for cinematic
+    /// trailers and gameplay where the action is near the centre.
+    FitBlurTall,
 }
 
 fn default_height() -> u32 {

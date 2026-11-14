@@ -85,6 +85,12 @@ pub struct ResolvedCaptions {
     pub position: CaptionPosition,
     /// Blocks on the output timeline.
     pub blocks: Vec<CaptionBlock>,
+    /// Hook headline pinned to the top for the whole timeline.
+    #[serde(default)]
+    pub headline: Option<String>,
+    /// Words rendered with emphasis.
+    #[serde(default)]
+    pub highlight_words: Vec<String>,
 }
 
 /// Output raster.

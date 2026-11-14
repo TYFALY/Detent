@@ -174,6 +174,8 @@ pub fn run(input: Option<&Path>, seconds: f32) -> Result<()> {
         motion_cues: vec![],
         audio_transitions: vec![],
         captions: None,
+        headline: None,
+        highlight_words: Vec::new(),
         output: OutputSpec {
             aspect: AspectPreset::Vertical9x16,
             height: 1920,

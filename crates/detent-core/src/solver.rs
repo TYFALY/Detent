@@ -434,6 +434,10 @@ impl EdlSolver {
                 fg_width: out_w,
                 fg_height: even(f64::from(out_w) * src_h / src_w).min(out_h),
             },
+            OutputLayout::FitBlurTall => Layout::FitBlur {
+                fg_width: out_w,
+                fg_height: even(f64::from(out_w) * 5.0 / 4.0).min(out_h),
+            },
         };
         let (pic_w, pic_h) = match layout {
             Layout::Crop => (out_w, out_h),
@@ -564,6 +568,13 @@ impl EdlSolver {
                 style: spec.style,
                 position: spec.position,
                 blocks,
+                headline: edl
+                    .headline
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_owned),
+                highlight_words: edl.highlight_words.clone(),
             }
         });
 

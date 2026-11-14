@@ -230,6 +230,8 @@ pub fn synthetic_edl(index: &MediaIndex, clips: usize, seed: u32) -> SemanticEdl
             })
             .collect(),
         captions: Some(CaptionSpec::default()),
+        headline: None,
+        highlight_words: Vec::new(),
         output: OutputSpec::default(),
         clips: clips_v,
     }

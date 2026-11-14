@@ -137,6 +137,8 @@ fn edl() -> SemanticEdl {
             offset_ms: Some(200),
         }],
         captions: Some(CaptionSpec::default()),
+        headline: None,
+        highlight_words: Vec::new(),
         output: OutputSpec {
             aspect: AspectPreset::Vertical9x16,
             height: 640,
