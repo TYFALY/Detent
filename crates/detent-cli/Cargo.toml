@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-whisper = ["detent-indexer/whisper"]
+whisper = ["detent-indexer/whisper", "detent-mcp/whisper"]
 onnx = ["detent-indexer/onnx"]
 
 [dependencies]

@@ -35,6 +35,7 @@ pub mod transcript;
 pub mod onnx;
 #[cfg(feature = "whisper")]
 pub mod whisper;
+pub mod whisper_cli;
 
 pub use contact::{ContactSheetBuilder, GridSpec};
 pub use error::{IndexError, Result};
@@ -45,3 +46,4 @@ pub use saliency::{SaliencyTracker, SubjectDetector};
 pub use shots::{ShotConfig, ShotDetector};
 pub use source::{FrameSource, PcmSource, RgbFrame};
 pub use transcript::{NoTranscript, StaticTranscript, Transcriber, load_transcript_json};
+pub use whisper_cli::{WhisperCli, WhisperCliConfig};

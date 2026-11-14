@@ -10,7 +10,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 use detent_core::solver::Level;
 use detent_core::{EdlSolver, MediaIndex, ResolvedTimeline, SemanticEdl};
 use detent_indexer::ffmpeg::FfmpegTools;
-use detent_indexer::{NoTranscript, StaticTranscript, Transcriber};
 use detent_renderer::{
     Encoder, EncoderChoice, Quality, RenderMode, RenderOptions, Renderer, Tools,
 };
@@ -40,9 +39,13 @@ enum Cmd {
         /// Word-level transcript JSON (detent or WhisperX layout).
         #[arg(long, conflicts_with = "whisper_model")]
         transcript: Option<PathBuf>,
-        /// whisper.cpp ggml model (requires the `whisper` feature).
+        /// whisper.cpp ggml model, e.g. `ggml-base.en.bin` (default: `DETENT_WHISPER_MODEL`).
+        /// Runs through `whisper-cli` unless built with `--features whisper`.
         #[arg(long)]
         whisper_model: Option<PathBuf>,
+        /// `whisper-cli` executable (default: `DETENT_WHISPER_CLI` or PATH).
+        #[arg(long)]
+        whisper_cli: Option<PathBuf>,
         /// Language for whisper (e.g. `en`); auto-detect when omitted.
         #[arg(long)]
         language: Option<String>,
@@ -138,9 +141,20 @@ fn main() -> Result<()> {
             out,
             transcript,
             whisper_model,
+            whisper_cli,
             language,
             digest,
-        } => index(&input, out, transcript, whisper_model, language, digest),
+        } => index(
+            &input,
+            out,
+            detent_mcp::AsrChoice {
+                transcript_json: transcript,
+                whisper_model,
+                whisper_cli,
+                language,
+            },
+            digest,
+        ),
         Cmd::Solve {
             index,
             edl,
@@ -185,43 +199,14 @@ fn main() -> Result<()> {
     }
 }
 
-fn make_transcriber(
-    transcript: Option<PathBuf>,
-    whisper_model: Option<PathBuf>,
-    language: Option<String>,
-) -> Result<Box<dyn Transcriber>> {
-    if let Some(t) = transcript {
-        return Ok(Box::new(StaticTranscript(
-            detent_indexer::load_transcript_json(&t)?,
-        )));
-    }
-    if let Some(model) = whisper_model {
-        #[cfg(feature = "whisper")]
-        {
-            return Ok(Box::new(detent_indexer::whisper::WhisperTranscriber::new(
-                &model, language,
-            )?));
-        }
-        #[cfg(not(feature = "whisper"))]
-        {
-            let _ = (model, language);
-            bail!("--whisper-model needs a build with `--features whisper`");
-        }
-    }
-    let _ = language;
-    Ok(Box::new(NoTranscript))
-}
-
 fn index(
     input: &Path,
     out: Option<PathBuf>,
-    transcript: Option<PathBuf>,
-    whisper_model: Option<PathBuf>,
-    language: Option<String>,
+    asr: detent_mcp::AsrChoice,
     digest: bool,
 ) -> Result<()> {
     let out_dir = out.unwrap_or_else(|| detent_mcp::default_out_dir(input));
-    let mut t = make_transcriber(transcript, whisper_model, language)?;
+    let mut t = detent_mcp::make_transcriber(asr)?;
     let r = detent_mcp::index_media_blocking(&FfmpegTools::from_env(), input, &out_dir, t.as_mut())
         .with_context(|| format!("indexing {}", input.display()))?;
     if digest {

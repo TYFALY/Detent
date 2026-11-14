@@ -67,7 +67,13 @@ detent solve talk.mp4.detent/index.json examples/edl.json
 detent render talk.mp4.detent/timeline.json -o short.mp4 --preview
 ```
 
-`detent index` writes `index.json` and `grid.jpg` into `talk.mp4.detent/`. The transcript is optional but strongly recommended: detent imports word-level JSON in its own format or the WhisperX / faster-whisper `segments[].words[]` layout. You can also build with `--features whisper` and pass `--whisper-model ggml-base.en.bin`.
+`detent index` writes `index.json` and `grid.jpg` into `talk.mp4.detent/`. A transcript is optional but strongly recommended, because the solver protects words. There are three ways to get one:
+
+- **Local, any OS, no compiler.** Download a prebuilt [`whisper-cli`](https://github.com/ggml-org/whisper.cpp/releases) and a ggml model, then run `detent index talk.mp4 --whisper-model ggml-base.en.bin`. Point `DETENT_WHISPER_CLI` at the binary if it is not on `PATH`; set `DETENT_WHISPER_MODEL` to make the model the default, including for the MCP server.
+- **Native.** Build with `--features whisper` to link whisper.cpp through `whisper-rs` (needs CMake, a C++ compiler and libclang; MSVC on Windows).
+- **Import.** Pass `--transcript words.json` in detent's own format or the WhisperX / faster-whisper `segments[].words[]` layout.
+
+Raw whisper word timestamps are often several hundred milliseconds off and stretch words across the silence that follows them. detent re-times them against the acoustic pauses before the solver sees them; see *Word re-timing* below.
 
 `detent solve` prints every cut it resolved, every automatic adjustment, and every request it could not honour. Here is real output for [`examples/edl.json`](examples/edl.json) against the 10-minute benchmark file, which has no transcript:
 
@@ -176,6 +182,15 @@ This is unconditionally stable and independent of frame rate. The impulse respon
 - crop windows non-empty, inside the source and at the output aspect;
 - caption blocks non-overlapping and monotonic.
 
+## Word re-timing
+
+whisper.cpp's per-word timestamps tend to swallow pauses. In one test narration (46 s, 15 detected pauses), every one of the 15 pauses was covered by a stretched word, so the solver would have found nowhere safe to cut. `detent_core::align` fixes this in two steps:
+
+1. A monotonic dynamic program matches each pause ≥ 200 ms to at most one word boundary. The cost is the distance from the boundary to the pause centre, minus a bonus when the preceding word ends in punctuation, or a fixed penalty for leaving the pause unmatched (a stop inside a word, a cough, music).
+2. Within each speech island between matched pauses, the whisper times are mapped affinely onto the island's acoustic extent. Word order and relative durations are kept.
+
+On that narration this left 0 of 15 pauses covered and turned 1 run-on "phrase" into the 10 real phrases. This pass runs only for raw ASR output; imported transcripts from forced aligners are left as they are.
+
 ## Engineering properties
 
 - **Bounded memory.** PCM is streamed in 64 KiB blocks and frames one at a time from FFmpeg child processes. The DSP analyzer holds one FFT window, and the envelope costs 1.2 KB per media second. FFmpeg stderr is drained on a thread into a 4 KiB tail, so a chatty decoder cannot deadlock the pipe. The renderer seeks one input per segment instead of `split`ting a decoded stream, so reordered clips never queue raw frames.
@@ -247,14 +262,14 @@ Tests that need FFmpeg skip with a message when it is not installed. CI runs `fm
 |---|---|---|
 | `dsp` | yes | Pure-Rust audio analysis |
 | `ffmpeg-cli` | yes | Streaming decoders over an `ffmpeg` child process |
-| `whisper` | no | `whisper-rs` (whisper.cpp) word-level ASR, streamed in ≤ 28 s windows cut at the quietest point |
+| `whisper` | no | Native `whisper-rs` (whisper.cpp) ASR, streamed in ≤ 28 s windows cut at the quietest point. Without it, `--whisper-model` runs a prebuilt `whisper-cli` subprocess instead |
 | `onnx` | no | `ort` UltraFace face detector, using ONNX Runtime loaded dynamically (`ORT_DYLIB_PATH`) |
 
 ## Limitations
 
 - The default subject tracker is a heuristic (motion energy, YCbCr skin prior and centre bias). It works for single-subject footage. Use `onnx` for real face detection.
 - The shot detector finds hard cuts, not dissolves or fades.
-- `whisper-rs` does not build with the `x86_64-pc-windows-gnu` toolchain (its build script passes the MSVC-only `/utf-8` flag to MinGW). Use MSVC or Linux, or import a transcript JSON.
+- The native `whisper` feature does not build with the `x86_64-pc-windows-gnu` toolchain (whisper-rs passes the MSVC-only `/utf-8` flag to MinGW). The default `whisper-cli` path works there.
 - The renderer opens one FFmpeg input per segment (two with audio). That keeps memory bounded, but very long EDLs (hundreds of clips) are better rendered in batches.
 
 ## License

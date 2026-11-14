@@ -20,6 +20,7 @@
 )]
 #![warn(missing_docs)]
 
+pub mod align;
 pub mod camera;
 pub mod captions;
 pub mod dsp;

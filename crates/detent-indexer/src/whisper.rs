@@ -123,4 +123,8 @@ impl Transcriber for WhisperTranscriber {
         words.sort_by_key(|w| w.start_ms);
         Ok(words)
     }
+
+    fn needs_alignment(&self) -> bool {
+        true
+    }
 }

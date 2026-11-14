@@ -11,6 +11,10 @@ authors.workspace = true
 name = "detent-mcp"
 path = "src/main.rs"
 
+[features]
+default = []
+whisper = ["detent-indexer/whisper"]
+
 [dependencies]
 detent-core.workspace = true
 detent-indexer = { workspace = true, features = ["dsp", "ffmpeg-cli"] }

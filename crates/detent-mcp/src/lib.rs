@@ -20,6 +20,7 @@ use detent_core::{CoreError, EdlSolver, MediaIndex, ResolvedTimeline, SemanticEd
 use detent_indexer::ffmpeg::FfmpegTools;
 use detent_indexer::{
     IndexOptions, IndexStats, NoTranscript, SaliencyTracker, StaticTranscript, Transcriber,
+    WhisperCli, WhisperCliConfig,
 };
 use detent_renderer::{
     Encoder, EncoderChoice, Quality, RenderMetrics, RenderMode, RenderOptions, Renderer, Tools,
@@ -83,6 +84,13 @@ pub struct IndexMediaOptions {
     /// without words the solver can only use acoustic pauses.
     #[serde(default)]
     pub transcript_json: Option<String>,
+    /// Transcribe locally with this whisper.cpp ggml model (e.g. `ggml-base.en.bin`).
+    /// Defaults to the server's `DETENT_WHISPER_MODEL`. Ignored when `transcript_json` is set.
+    #[serde(default)]
+    pub whisper_model: Option<String>,
+    /// Spoken language for whisper (`en`, `fr`, …); auto-detected when omitted.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Directory for index.json / grid.jpg (default: `<media>.detent/` next to the file).
     #[serde(default)]
     pub out_dir: Option<String>,
@@ -99,6 +107,8 @@ impl Default for IndexMediaOptions {
     fn default() -> Self {
         Self {
             transcript_json: None,
+            whisper_model: None,
+            language: None,
             out_dir: None,
             include_image: true,
         }
@@ -210,6 +220,53 @@ fn read_index(path: &str) -> Result<MediaIndex, String> {
     MediaIndex::from_json(&text).map_err(|e| e.to_string())
 }
 
+/// How to obtain word timings while indexing.
+#[derive(Debug, Clone, Default)]
+pub struct AsrChoice {
+    /// Pre-computed transcript JSON (wins over everything else).
+    pub transcript_json: Option<PathBuf>,
+    /// whisper.cpp model; falls back to `DETENT_WHISPER_MODEL`.
+    pub whisper_model: Option<PathBuf>,
+    /// `whisper-cli` binary; falls back to `DETENT_WHISPER_CLI`, then PATH.
+    pub whisper_cli: Option<PathBuf>,
+    /// Spoken language; auto-detected when `None` (English for `*.en` models).
+    pub language: Option<String>,
+}
+
+/// Picks a transcriber: transcript JSON → whisper model (native `whisper-rs`
+/// when compiled with the `whisper` feature, otherwise the `whisper-cli`
+/// subprocess) → no transcript.
+pub fn make_transcriber(asr: AsrChoice) -> anyhow::Result<Box<dyn Transcriber>> {
+    if let Some(t) = asr.transcript_json {
+        return Ok(Box::new(StaticTranscript(
+            detent_indexer::load_transcript_json(&t)?,
+        )));
+    }
+    let model = asr
+        .whisper_model
+        .or_else(|| std::env::var_os("DETENT_WHISPER_MODEL").map(PathBuf::from));
+    let Some(model) = model else {
+        return Ok(Box::new(NoTranscript));
+    };
+    #[cfg(feature = "whisper")]
+    {
+        let _ = asr.whisper_cli;
+        Ok(Box::new(detent_indexer::whisper::WhisperTranscriber::new(
+            &model,
+            asr.language,
+        )?))
+    }
+    #[cfg(not(feature = "whisper"))]
+    {
+        let mut cfg = WhisperCliConfig::new(model);
+        if let Some(bin) = asr.whisper_cli {
+            cfg.binary = bin;
+        }
+        cfg.language = asr.language;
+        Ok(Box::new(WhisperCli::new(cfg)?))
+    }
+}
+
 /// Default sidecar directory `<media>.detent/`.
 pub fn default_out_dir(media: &Path) -> PathBuf {
     let mut name = media.file_name().unwrap_or_default().to_os_string();
@@ -282,12 +339,12 @@ plus the index_path needed by the other tools."
                 .out_dir
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_out_dir(&path));
-            let mut transcriber: Box<dyn Transcriber> = match &p.options.transcript_json {
-                Some(t) => Box::new(StaticTranscript(detent_indexer::load_transcript_json(
-                    Path::new(t),
-                )?)),
-                None => Box::new(NoTranscript),
-            };
+            let mut transcriber = make_transcriber(AsrChoice {
+                transcript_json: p.options.transcript_json.map(PathBuf::from),
+                whisper_model: p.options.whisper_model.map(PathBuf::from),
+                whisper_cli: None,
+                language: p.options.language,
+            })?;
             index_media_blocking(&state.ffmpeg, &path, &out_dir, transcriber.as_mut())
         })
         .await;

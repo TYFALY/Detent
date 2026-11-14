@@ -18,6 +18,11 @@ pub trait Transcriber: Send {
     fn push(&mut self, samples: &[f32]) -> Result<()>;
     /// Flushes and returns all words sorted by start time.
     fn finish(&mut self) -> Result<Vec<WordToken>>;
+    /// Whether word times should be re-timed against acoustic pauses
+    /// (true for raw whisper output, false for force-aligned imports).
+    fn needs_alignment(&self) -> bool {
+        false
+    }
 }
 
 /// Produces no words (indexing without ASR).

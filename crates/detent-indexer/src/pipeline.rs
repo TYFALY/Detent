@@ -37,6 +37,8 @@ pub struct IndexOptions {
     pub contact_grid: Option<(u32, u32)>,
     /// Where to write the contact sheet.
     pub contact_sheet_path: Option<std::path::PathBuf>,
+    /// Re-time raw ASR words against acoustic pauses (see `detent_core::align`).
+    pub align_words: bool,
 }
 
 impl Default for IndexOptions {
@@ -48,6 +50,7 @@ impl Default for IndexOptions {
             analysis_width: 160,
             contact_grid: Some((4, 4)),
             contact_sheet_path: None,
+            align_words: true,
         }
     }
 }
@@ -134,9 +137,18 @@ where
             pcm.close()?;
             let samples = analyzer.samples_consumed();
             let telemetry = detent_core::dsp::analyze(analyzer.finish(), &opts.pauses);
+            let mut words = transcriber.finish()?;
+            if opts.align_words && transcriber.needs_alignment() {
+                words = detent_core::align::retime_words(
+                    &words,
+                    &telemetry.pauses,
+                    duration_ms,
+                    &detent_core::align::AlignConfig::default(),
+                );
+            }
             Ok(Some(AudioOut {
                 telemetry,
-                words: transcriber.finish()?,
+                words,
                 samples,
             }))
         });
