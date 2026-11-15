@@ -51,16 +51,17 @@ pub(crate) use {generic_debug, generic_error, generic_info, generic_trace, gener
 #[cfg_attr(not(windows), repr(u32))]
 // Of course Windows thinks it's a special little shit and
 // picks a signed integer for an unsigned type
-// detent patch: C enums are `int` on every Windows ABI (MSVC and MinGW).
+// detent patch: whether bindgen types these C enums as i32 or u32 depends on
+// the libclang build (MSVC- or GNU-flavoured), so discriminants are cast.
 #[cfg_attr(windows, repr(i32))]
 #[derive(Debug)]
 pub enum GGMLLogLevel {
-    None = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_NONE,
-    Info = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_INFO,
-    Warn = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_WARN,
-    Error = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_ERROR,
-    Debug = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_DEBUG,
-    Cont = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_CONT,
+    None = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_NONE as _,
+    Info = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_INFO as _,
+    Warn = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_WARN as _,
+    Error = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_ERROR as _,
+    Debug = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_DEBUG as _,
+    Cont = whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_CONT as _,
     Unknown(ggml_log_level),
 }
 impl From<ggml_log_level> for GGMLLogLevel {

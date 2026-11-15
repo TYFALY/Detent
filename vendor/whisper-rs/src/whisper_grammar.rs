@@ -6,24 +6,25 @@ use whisper_rs_sys::{
 };
 
 #[cfg_attr(not(windows), repr(u32))] // include windows-gnu
-// detent patch: C enums are `int` on every Windows ABI (MSVC and MinGW).
+// detent patch: whether bindgen types these C enums as i32 or u32 depends on
+// the libclang build (MSVC- or GNU-flavoured), so discriminants are cast.
 #[cfg_attr(windows, repr(i32))] // msvc being *special* again
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum WhisperGrammarElementType {
     /// End of rule definition
-    End = whisper_gretype_WHISPER_GRETYPE_END,
+    End = whisper_gretype_WHISPER_GRETYPE_END as _,
     /// Start of alternate definition for a rule
-    Alternate = whisper_gretype_WHISPER_GRETYPE_ALT,
+    Alternate = whisper_gretype_WHISPER_GRETYPE_ALT as _,
     /// Non-terminal element: reference to another rule
-    RuleReference = whisper_gretype_WHISPER_GRETYPE_RULE_REF,
+    RuleReference = whisper_gretype_WHISPER_GRETYPE_RULE_REF as _,
     /// Terminal element: character (code point)
-    Character = whisper_gretype_WHISPER_GRETYPE_CHAR,
+    Character = whisper_gretype_WHISPER_GRETYPE_CHAR as _,
     /// Inverse of a character(s)
-    NotCharacter = whisper_gretype_WHISPER_GRETYPE_CHAR_NOT,
+    NotCharacter = whisper_gretype_WHISPER_GRETYPE_CHAR_NOT as _,
     /// Modifies a preceding [Self::Character] to be an inclusive range
-    CharacterRangeUpper = whisper_gretype_WHISPER_GRETYPE_CHAR_RNG_UPPER,
+    CharacterRangeUpper = whisper_gretype_WHISPER_GRETYPE_CHAR_RNG_UPPER as _,
     /// Modifies a preceding [Self::Character] to add an alternate character to match
-    CharacterAlternate = whisper_gretype_WHISPER_GRETYPE_CHAR_ALT,
+    CharacterAlternate = whisper_gretype_WHISPER_GRETYPE_CHAR_ALT as _,
 }
 
 impl From<whisper_rs_sys::whisper_gretype> for WhisperGrammarElementType {

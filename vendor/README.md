@@ -13,7 +13,8 @@ Upstream does not build on `x86_64-pc-windows-gnu`. Every change is marked
 | `/utf-8` (an MSVC-only flag) is passed to GCC, which treats it as an input file | added only when the *target* env is `msvc` (`whisper-rs-sys/build.rs`) |
 | libclang finds neither its resource headers nor the MinGW headers, so bindgen falls back to bundled Linux bindings whose layouts are wrong on Windows (`long` is 4 bytes) | bindgen gets the C compiler's own `#include <...>` search list (`gnu_system_includes`) |
 | ggml's CMake drops the `lib` prefix on WIN32, so `static=ggml` finds no `libggml.a` | `libggml*.a` copies are added after the build (`add_lib_prefix`) |
-| Rust enums mirror C enums as `u32` on windows-gnu, but C enums are `int` on every Windows ABI | `repr(i32)` on all Windows targets (`whisper-rs/src/common_logging.rs`, `whisper_grammar.rs`) |
+| Rust enums hard-code the C enums' type (`u32` vs `i32`), but bindgen's choice on Windows depends on the libclang build | discriminants are cast (`as _`), so either type compiles (`whisper-rs/src/common_logging.rs`, `whisper_grammar.rs`) |
+| Generated bindings trip workspace lints (`unnecessary_transmutes` on Linux) once the crate is a path dependency | `#![allow(warnings, clippy::all)]` in both vendored `lib.rs` |
 | A dynamic `libstdc++-6.dll` binds to whichever copy is first on PATH at run time (Git for Windows ships an old one), killing the process with `STATUS_ENTRYPOINT_NOT_FOUND` | libstdc++ and winpthread are linked statically on windows-gnu (`link_static_mingw_runtime`) |
 
 To keep the checkout small, only the CPU and BLAS ggml backends are kept

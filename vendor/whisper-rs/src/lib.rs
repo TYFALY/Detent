@@ -1,3 +1,5 @@
+// detent patch: vendored code is not held to the workspace lints.
+#![allow(warnings, clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 #![cfg_attr(test, feature(test))]
 
