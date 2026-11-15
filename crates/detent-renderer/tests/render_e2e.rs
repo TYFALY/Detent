@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use detent_core::edl::{
-    AspectPreset, AudioTransition, CaptionSpec, EdlClip, Intensity, MotionCue, MotionPreset,
-    OutputSpec, SemanticEdl, TransitionKind,
+    AspectPreset, AudioMix, AudioTransition, CaptionSpec, ColorGrade, EdlClip, Intensity,
+    MotionCue, MotionPreset, OutputLayout, OutputSpec, SemanticEdl, TransitionKind,
+    VideoTransition, VideoTransitionKind,
 };
 use detent_core::index::{ExcitementPeak, WordToken};
 use detent_core::{EdlSolver, ResolvedTimeline};
@@ -139,10 +140,14 @@ fn edl() -> SemanticEdl {
         captions: Some(CaptionSpec::default()),
         headline: None,
         highlight_words: Vec::new(),
+        headline_duration_ms: None,
+        video_transitions: Vec::new(),
+        tighten: None,
         output: OutputSpec {
             aspect: AspectPreset::Vertical9x16,
             height: 640,
             layout: Default::default(),
+            ..OutputSpec::default()
         },
     }
 }
@@ -195,6 +200,60 @@ fn full_render_is_frame_exact() {
 }
 
 #[test]
+fn finishing_effects_keep_frames_and_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(src) = fixture(dir.path()) else {
+        return;
+    };
+    for layout in [OutputLayout::Crop, OutputLayout::FitBlurTall] {
+        let mut e = edl();
+        e.headline = Some("The hook".into());
+        e.headline_duration_ms = Some(3_000);
+        e.video_transitions = vec![VideoTransition {
+            after_clip: 0,
+            kind: VideoTransitionKind::Flash,
+        }];
+        e.output.layout = layout;
+        e.output.grade = ColorGrade::MobilePop;
+        e.output.audio_mix = AudioMix::VoiceForward;
+        e.output.opening_pop = true;
+        let t = solve(&src, dir.path(), &e);
+        assert!(t.splices[0].flash);
+        assert!(!copy_eligible(&t), "finishing effects need a re-encode");
+        let renderer = Renderer::new(Tools::default()).unwrap();
+        let out = dir.path().join(format!("finish-{layout:?}.mp4"));
+        renderer
+            .render(
+                &t,
+                &out,
+                &RenderOptions {
+                    quality: Quality::Draft,
+                    encoder: EncoderChoice::Force(Encoder::Libx264),
+                    mode: RenderMode::Full,
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        let p = probe(&out);
+        let v = stream(&p, "video");
+        assert_eq!(
+            (v["width"].as_u64(), v["height"].as_u64()),
+            (Some(360), Some(640))
+        );
+        let expected: i64 = t.segments.iter().map(|s| s.video.frames()).sum();
+        let got: i64 = v["nb_read_frames"].as_str().unwrap().parse().unwrap();
+        assert_eq!(got, expected, "{layout:?}");
+        let a = stream(&p, "audio");
+        let a_dur: f64 = a["duration"].as_str().unwrap().parse().unwrap();
+        let v_dur = t.duration_us as f64 / 1e6;
+        assert!(
+            (a_dur - v_dur).abs() < 0.05,
+            "{layout:?}: audio {a_dur}s vs video {v_dur}s"
+        );
+    }
+}
+
+#[test]
 fn preview_uses_stream_copy_when_possible() {
     let dir = tempfile::tempdir().unwrap();
     let Some(src) = fixture(dir.path()) else {
@@ -207,6 +266,7 @@ fn preview_uses_stream_copy_when_possible() {
         aspect: AspectPreset::Source,
         height: 360,
         layout: Default::default(),
+        ..OutputSpec::default()
     };
     let t = solve(&src, dir.path(), &e);
     assert!(copy_eligible(&t));

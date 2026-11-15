@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::camera::{Framing, SegmentCamera, solve_segment};
 use crate::captions::{TimedWord, chunk};
-use crate::edl::{MIN_CLIP_MS, MotionPreset, OutputLayout, SemanticEdl, TransitionKind};
+use crate::edl::{
+    MIN_CLIP_MS, MotionPreset, OutputLayout, SemanticEdl, TransitionKind, VideoTransitionKind,
+};
 use crate::error::{CoreError, Result, ValidationIssue};
 use crate::index::{MediaIndex, PauseKind};
 use crate::time::{FrameRate, US_PER_MS, UsRange, ms_to_us, us_to_ms};
@@ -269,8 +271,45 @@ impl EdlSolver {
     }
 
     /// Validates `edl` against `index` and resolves it.
+    ///
+    /// With `tighten`, clips are first split at long pauses; segment
+    /// `clip_index` values still point at the clips of the EDL as written,
+    /// while report cuts and diagnostics count the split pieces.
     pub fn solve(&self, edl: &SemanticEdl, index: &MediaIndex) -> Result<Resolution> {
         index.validate()?;
+        edl.validate(index)?;
+        let Some(tighten) = edl.tighten else {
+            return self.solve_validated(edl, index, &[]);
+        };
+        let (expanded, origin, removed_ms) = edl.tightened(index, tighten.max_silence_ms);
+        let pieces = expanded.clips.len();
+        // Edges created by dead-air removal are exact: snapping them toward the
+        // middle of the pause would put the silence back.
+        let pinned: Vec<bool> = origin.windows(2).map(|w| w[0] == w[1]).collect();
+        let mut res = self.solve_validated(&expanded, index, &pinned)?;
+        for s in &mut res.timeline.segments {
+            s.clip_index = origin[s.clip_index];
+        }
+        res.report.diag(
+            Level::Info,
+            "dead_air_removed",
+            None,
+            format!(
+                "tighten removed {} pause(s), {removed_ms} ms of dead air: {} clip(s) became {pieces} piece(s); report cuts are numbered by piece",
+                pieces - edl.clips.len(),
+                edl.clips.len()
+            ),
+        );
+        Ok(res)
+    }
+
+    /// `pinned[k]` marks the splice after clip `k` as exact (no snapping).
+    fn solve_validated(
+        &self,
+        edl: &SemanticEdl,
+        index: &MediaIndex,
+        pinned: &[bool],
+    ) -> Result<Resolution> {
         edl.validate(index)?;
         let video = index
             .source
@@ -290,8 +329,24 @@ impl EdlSolver {
         for (i, clip) in edl.clips.iter().enumerate() {
             let req_in = ms_to_us(clip.start_ms);
             let req_out = ms_to_us(clip.end_ms);
-            let a = self.resolve_edge(index, fps, i, Edge::In, req_in, &mut rep);
-            let b = self.resolve_edge(index, fps, i, Edge::Out, req_out, &mut rep);
+            let pin_in = i > 0 && pinned.get(i - 1).copied().unwrap_or(false);
+            let pin_out = pinned.get(i).copied().unwrap_or(false);
+            let a = if pin_in {
+                Cut {
+                    us: req_in,
+                    frame: None,
+                }
+            } else {
+                self.resolve_edge(index, fps, i, Edge::In, req_in, &mut rep)
+            };
+            let b = if pin_out {
+                Cut {
+                    us: req_out,
+                    frame: None,
+                }
+            } else {
+                self.resolve_edge(index, fps, i, Edge::Out, req_out, &mut rep)
+            };
             let mut fa = self.quantize(index, fps, a);
             let mut fb = self.quantize(index, fps, b).min(total_frames);
             if fb - fa < min_frames {
@@ -403,6 +458,7 @@ impl EdlSolver {
                 after_segment: k,
                 crossfade_us: c,
                 av_offset_us: offsets[k],
+                flash: edl.video_transition_after(k) == VideoTransitionKind::Flash,
             });
         }
         if !has_audio {
@@ -574,6 +630,9 @@ impl EdlSolver {
                     .map(str::trim)
                     .filter(|h| !h.is_empty())
                     .map(str::to_owned),
+                headline_end_us: edl
+                    .headline_duration_ms
+                    .map(|d| ms_to_us(u64::from(d)).min(duration_us)),
                 highlight_words: edl.highlight_words.clone(),
             }
         });
@@ -658,6 +717,9 @@ impl EdlSolver {
                 height: out_h,
                 fps,
                 layout,
+                grade: edl.output.grade,
+                audio_mix: edl.output.audio_mix,
+                opening_pop: edl.output.opening_pop,
             },
             segments,
             splices,

@@ -144,6 +144,7 @@ impl Renderer {
                         headline: c.headline.as_deref(),
                         highlight_words: &c.highlight_words,
                         duration_us: t.duration_us,
+                        headline_end_us: c.headline_end_us,
                     },
                 );
                 let p = work.path().join("captions.ass");
@@ -244,7 +245,12 @@ impl Renderer {
 
 /// True when the timeline can be previewed without decoding.
 pub fn copy_eligible(t: &ResolvedTimeline) -> bool {
-    !t.needs_reframe() && t.captions.as_ref().is_none_or(|c| c.blocks.is_empty())
+    let o = &t.output;
+    let finishing = o.opening_pop
+        || o.grade != detent_core::edl::ColorGrade::None
+        || o.audio_mix != detent_core::edl::AudioMix::Source
+        || t.splices.iter().any(|s| s.flash);
+    !finishing && !t.needs_reframe() && t.captions.as_ref().is_none_or(|c| c.blocks.is_empty())
 }
 
 fn absolute(p: &Path) -> Result<PathBuf> {

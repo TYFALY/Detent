@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::camera::CameraPath;
 use crate::captions::CaptionBlock;
-use crate::edl::{AspectPreset, CaptionPosition, CaptionStyle};
+use crate::edl::{AspectPreset, AudioMix, CaptionPosition, CaptionStyle, ColorGrade};
 use crate::time::{FrameRate, UsRange};
 
 /// Current on-disk schema version of [`ResolvedTimeline`].
@@ -74,6 +74,9 @@ pub struct Splice {
     /// Audio offset relative to the picture cut (µs): `> 0` J-cut (audio
     /// leads), `< 0` L-cut (audio lags), `0` straight cut.
     pub av_offset_us: i64,
+    /// The next segment opens with a short white flash.
+    #[serde(default)]
+    pub flash: bool,
 }
 
 /// Burned-in captions.
@@ -88,6 +91,9 @@ pub struct ResolvedCaptions {
     /// Hook headline pinned to the top for the whole timeline.
     #[serde(default)]
     pub headline: Option<String>,
+    /// When the headline leaves the screen (µs); `None` pins it throughout.
+    #[serde(default)]
+    pub headline_end_us: Option<i64>,
     /// Words rendered with emphasis.
     #[serde(default)]
     pub highlight_words: Vec<String>,
@@ -107,6 +113,15 @@ pub struct OutputFormat {
     /// Composition of the picture inside the raster.
     #[serde(default)]
     pub layout: Layout,
+    /// Colour finish.
+    #[serde(default)]
+    pub grade: ColorGrade,
+    /// Audio finish.
+    #[serde(default)]
+    pub audio_mix: AudioMix,
+    /// First segment scales in 100% → 108% over 0.4 s.
+    #[serde(default)]
+    pub opening_pop: bool,
 }
 
 /// Resolved composition.

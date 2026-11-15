@@ -1,0 +1,24 @@
+{
+  "clips": [
+    { "start_ms": 312400, "end_ms": 319900, "hook_score": 0.92,
+      "editorial_note": "Counter-intuitive claim; strongest opening line." },
+    { "start_ms": 41200, "end_ms": 52800, "hook_score": 0.55,
+      "editorial_note": "Context the claim depends on." },
+    { "start_ms": 330100, "end_ms": 341000, "hook_score": 0.61,
+      "editorial_note": "Payoff with on-camera demo." }
+  ],
+  "motion_cues": [
+    { "clip": 0, "preset": "SpringPunchIn", "intensity": "Strong" },
+    { "clip": 2, "preset": "SpringPunchIn", "intensity": "Medium" }
+  ],
+  "audio_transitions": [ { "after_clip": 0, "kind": "AutoJCut", "offset_ms": 220 } ],
+  "video_transitions": [ { "after_clip": 1, "kind": "Flash" } ],
+  "tighten": { "max_silence_ms": 200 },
+  "captions": { "style": "BoldPop", "position": "Lower",
+                "grouping": { "min_words": 2, "max_words": 4, "max_chars": 24, "pause_break_ms": 300 } },
+  "headline": "The mistake ruining your audio",
+  "headline_duration_ms": 3000,
+  "highlight_words": ["mistake"],
+  "output": { "aspect": "Vertical9x16", "height": 1920, "layout": "Crop",
+              "opening_pop": true, "grade": "MobilePop", "audio_mix": "VoiceForward" }
+}

@@ -44,6 +44,10 @@ and `digest.shots_ms`. Look at the contact sheet image to judge framing. If `dig
 and audio intent only via presets. Cut points may be approximate: the solver snaps them into breath \
 valleys (±120 ms), onto nearby shot changes, applies J/L-cuts and micro-crossfades, and reports \
 every adjustment. If it returns validation issues, fix ALL of them (each has a JSON pointer) and retry.
+For short-form vertical edits: open on the boldest line (no preamble), set `tighten` to cut dead air, \
+a 3-5 word `headline` with `headline_duration_ms: 3000`, `captions` with 2-4 words per block, \
+`output.opening_pop`, `output.grade: MobilePop` and `output.audio_mix: VoiceForward`. Keep most splices \
+clean cuts; use `video_transitions` `Flash` only for a shock moment or beat drop.
 4. render_timeline(timeline_path, output_path) — use mode=preview first for a fast check.
 Never invent pixel coordinates or FFmpeg filters; the schema does not accept them.";
 

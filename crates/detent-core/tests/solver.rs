@@ -3,7 +3,7 @@
 
 use detent_core::edl::{
     AspectPreset, AudioTransition, CaptionSpec, EdlClip, Intensity, MotionCue, MotionPreset,
-    OutputSpec, SemanticEdl, TransitionKind,
+    OutputSpec, SemanticEdl, TightenSpec, TransitionKind, VideoTransition, VideoTransitionKind,
 };
 use detent_core::index::{
     AudioStreamInfo, AudioTelemetry, ExcitementPeak, INDEX_VERSION, MediaIndex, PauseKind,
@@ -90,6 +90,9 @@ fn edl(clips: Vec<EdlClip>) -> SemanticEdl {
         captions: None,
         headline: None,
         highlight_words: Vec::new(),
+        headline_duration_ms: None,
+        video_transitions: Vec::new(),
+        tighten: None,
         output: OutputSpec::default(),
     }
 }
@@ -118,6 +121,90 @@ fn talk() -> MediaIndex {
         8_000,
         fps30(),
     )
+}
+
+#[test]
+fn tighten_removes_dead_air_without_touching_words() {
+    let idx = talk();
+    let mut e = edl(vec![clip(900, 6_700), clip(900, 2_300)]);
+    e.motion_cues = vec![MotionCue {
+        clip: 0,
+        preset: MotionPreset::SlowCreep,
+        intensity: Intensity::Subtle,
+    }];
+    e.video_transitions = vec![VideoTransition {
+        after_clip: 0,
+        kind: VideoTransitionKind::Flash,
+    }];
+    e.captions = Some(CaptionSpec::default());
+    let plain = EdlSolver::default().solve(&e, &idx).unwrap();
+    e.tighten = Some(TightenSpec::default());
+    let res = EdlSolver::default().solve(&e, &idx).unwrap();
+    let t = &res.timeline;
+    assert!(t.verify().is_empty(), "{:?}", t.verify());
+    // Clip 0 is split at both 800 ms pauses; clip 1 has none inside.
+    let origins: Vec<usize> = t.segments.iter().map(|s| s.clip_index).collect();
+    assert_eq!(origins, vec![0, 0, 0, 1]);
+    assert!(
+        t.segments[..3]
+            .iter()
+            .all(|s| s.camera.preset == MotionPreset::SlowCreep)
+    );
+    // The flash stays on the splice between the two original clips.
+    let flashes: Vec<bool> = t.splices.iter().map(|s| s.flash).collect();
+    assert_eq!(flashes, vec![false, false, true]);
+    assert!(
+        plain.timeline.duration_us - t.duration_us > 1_000_000,
+        "at least a second of dead air removed: {:#?} vs {:#?}",
+        res.report.cuts,
+        plain.timeline.duration_us
+    );
+    assert!(
+        res.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "dead_air_removed")
+    );
+    assert!(
+        !res.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "cut_inside_word"),
+        "{:?}",
+        res.report.diagnostics
+    );
+    // Every word still reaches the captions.
+    let words: usize = t
+        .captions
+        .as_ref()
+        .unwrap()
+        .blocks
+        .iter()
+        .map(|b| b.words.len())
+        .sum();
+    assert_eq!(words, 12 + 3);
+}
+
+#[test]
+fn tighten_and_flash_are_validated() {
+    let idx = talk();
+    let mut e = edl(vec![clip(900, 2_300)]);
+    e.video_transitions = vec![VideoTransition {
+        after_clip: 0,
+        kind: VideoTransitionKind::Flash,
+    }];
+    e.tighten = Some(TightenSpec { max_silence_ms: 50 });
+    e.headline_duration_ms = Some(3_000);
+    let Err(CoreError::Validation(issues)) = EdlSolver::default().solve(&e, &idx) else {
+        panic!("expected validation errors");
+    };
+    let paths: Vec<&str> = issues.iter().map(|i| i.path.as_str()).collect();
+    assert!(
+        paths.contains(&"/video_transitions/0/after_clip"),
+        "{paths:?}"
+    );
+    assert!(paths.contains(&"/tighten/max_silence_ms"), "{paths:?}");
+    assert!(paths.contains(&"/headline_duration_ms"), "{paths:?}");
 }
 
 #[test]
@@ -608,10 +695,14 @@ fn arb_scenario() -> impl Strategy<Value = Scenario> {
                             captions: (caps && has_words).then(CaptionSpec::default),
                             headline: None,
                             highlight_words: Vec::new(),
+                            headline_duration_ms: None,
+                            video_transitions: Vec::new(),
+                            tighten: None,
                             output: OutputSpec {
                                 aspect,
                                 height: 1920,
                                 layout: Default::default(),
+                                ..OutputSpec::default()
                             },
                         },
                     }

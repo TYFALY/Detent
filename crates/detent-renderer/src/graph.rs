@@ -9,6 +9,7 @@
 
 use detent_core::ResolvedTimeline;
 use detent_core::camera::CameraPath;
+use detent_core::edl::{AudioMix, ColorGrade};
 use detent_core::timeline::Layout;
 
 use crate::encoder::Encoder;
@@ -129,6 +130,33 @@ crop=w={ow}:h={oh}:x='min(max(0,({x})*iw),iw-{ow})':y='min(max(0,({y})*ih),ih-{o
     }
 }
 
+/// Frames of white at the start of a `Flash` splice.
+pub const FLASH_FRAMES: u32 = 4;
+/// Opening scale-in: final zoom and duration (s).
+pub const OPENING_POP: (f64, f64) = (1.08, 0.4);
+
+/// Per-segment finishing filters on the composed picture (leading comma
+/// included, empty when there is nothing to do).
+fn segment_post(t: &ResolvedTimeline, i: usize) -> String {
+    let mut post = String::new();
+    if i == 0 && t.output.opening_pop {
+        // Smoothstep scale 1 → 1.08 over 0.4 s, centre crop back to the raster.
+        let (w, h) = (t.output.width, t.output.height);
+        let (z, d) = OPENING_POP;
+        let e = format!(
+            "(1+{dz}*(3*pow(min(t/{d},1),2)-2*pow(min(t/{d},1),3)))",
+            dz = z - 1.0
+        );
+        post.push_str(&format!(
+            ",scale=w='2*ceil({w}*{e}/2)':h='2*ceil({h}*{e}/2)':eval=frame:flags=bicubic,crop={w}:{h}:exact=1"
+        ));
+    }
+    if i > 0 && t.splices.get(i - 1).is_some_and(|s| s.flash) {
+        post.push_str(&format!(",fade=t=in:s=0:n={FLASH_FRAMES}:color=white"));
+    }
+    post
+}
+
 /// Builds the graph. `ass_file` is a path relative to FFmpeg's working dir.
 pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -> CompiledGraph {
     let src = (t.source.width, t.source.height);
@@ -158,6 +186,7 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
             "[{v_in}:v:0]tpad=stop_mode=clone:stop=3,trim=end_frame={frames},setpts=PTS-STARTPTS",
             frames = seg.video.frames(),
         );
+        let post = segment_post(t, i);
         if fit_blur {
             // Blurred, darkened cover fill computed at quarter resolution
             // (cheap), with the camera picture centred on top.
@@ -172,10 +201,10 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
             ));
             stmts.push(format!("[f{i}]{cam},setsar=1[p{i}]"));
             stmts.push(format!(
-                "[g{i}][p{i}]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,setsar=1[v{i}]"
+                "[g{i}][p{i}]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1{post},setsar=1[v{i}]"
             ));
         } else {
-            stmts.push(format!("{head}{cam},setsar=1[v{i}]"));
+            stmts.push(format!("{head}{cam}{post},setsar=1[v{i}]"));
         }
         if t.source.has_audio {
             let a_in = inputs.len();
@@ -200,18 +229,27 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
     let subs = ass_file
         .map(|p| format!("ass=filename={p},"))
         .unwrap_or_default();
-    stmts.push(format!("[vcat]{subs}{}[vout]", encoder.upload_filter()));
+    let grade = match t.output.grade {
+        ColorGrade::None => "",
+        ColorGrade::MobilePop => "eq=contrast=1.08:saturation=1.05,unsharp=5:5:0.6:5:5:0.0,",
+    };
+    stmts.push(format!(
+        "[vcat]{grade}{subs}{}[vout]",
+        encoder.upload_filter()
+    ));
 
     // Sound: chain of equal-power micro-crossfades.
     if t.source.has_audio {
+        let voice = t.output.audio_mix == AudioMix::VoiceForward;
+        let final_label = if voice { "amix0" } else { "aout" };
         if t.splices.is_empty() {
-            stmts.push("[a0]anull[aout]".to_owned());
+            stmts.push(format!("[a0]anull[{final_label}]"));
         }
         let mut acc = "a0".to_owned();
         for (k, sp) in t.splices.iter().enumerate() {
             let next = format!("a{}", k + 1);
             let label = if k + 1 == t.splices.len() {
-                "aout".to_owned()
+                final_label.to_owned()
             } else {
                 format!("ax{k}")
             };
@@ -224,6 +262,15 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
                 format!("[{acc}][{next}]concat=n=2:v=0:a=1[{label}]")
             });
             acc = label;
+        }
+        if voice {
+            // Rumble cut, 3:1 compression from -20 dBFS, then single-pass
+            // loudness normalisation (which works at 192 kHz internally).
+            stmts.push(
+                "[amix0]highpass=f=80,acompressor=threshold=0.1:ratio=3:attack=5:release=150:makeup=1.5,\
+loudnorm=I=-14:TP=-3:LRA=9,aresample=48000[aout]"
+                    .to_owned(),
+            );
         }
     }
     let f = stmts.join(";\n");
@@ -293,6 +340,9 @@ mod tests {
                 height: 1920,
                 fps,
                 layout: Default::default(),
+                grade: Default::default(),
+                audio_mix: Default::default(),
+                opening_pop: false,
             },
             segments: vec![
                 seg(0, 30, 90, 0, path(vec![kf(0, 656.25, 607.5)])),
@@ -308,6 +358,7 @@ mod tests {
                 after_segment: 0,
                 crossfade_us: 20_000,
                 av_offset_us: 0,
+                flash: false,
             }],
             captions: None,
             duration_us: 4_000_000,
@@ -423,6 +474,7 @@ mod tests {
             after_segment: 1,
             crossfade_us: 0,
             av_offset_us: 0,
+            flash: false,
         });
         let f = compile(&t, Encoder::Libx264, None).filter;
         assert!(f.contains("[a0][a1]acrossfade=d=0.020000:c1=qsin:c2=qsin[ax0]"));

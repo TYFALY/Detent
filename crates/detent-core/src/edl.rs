@@ -45,6 +45,18 @@ pub struct SemanticEdl {
     /// `WordBounce` renders them green and slightly larger.
     #[serde(default)]
     pub highlight_words: Vec<String>,
+    /// How long the headline stays on screen (ms from the start). Omit to pin
+    /// it for the whole video; 3000 gives a classic 3-second hook banner.
+    #[serde(default)]
+    #[schemars(range(min = 1000, max = 60000))]
+    pub headline_duration_ms: Option<u32>,
+    /// Picture transition per splice. Splices without an entry are clean hard
+    /// cuts (85-90% of cuts should stay that way).
+    #[serde(default)]
+    pub video_transitions: Vec<VideoTransition>,
+    /// Automatic dead-air removal inside clips. Omit to keep clips as chosen.
+    #[serde(default)]
+    pub tighten: Option<TightenSpec>,
     /// Output framing.
     #[serde(default)]
     pub output: OutputSpec,
@@ -131,6 +143,74 @@ pub struct AudioTransition {
     #[serde(default)]
     #[schemars(range(min = 150, max = 300))]
     pub offset_ms: Option<u32>,
+}
+
+/// Picture transition preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum VideoTransitionKind {
+    /// Clean cut (the default for every splice).
+    #[default]
+    Cut,
+    /// A 4-frame white flash into the next clip: kills, shock moments, beat drops.
+    Flash,
+}
+
+/// Picture transition at the splice between `after_clip` and `after_clip + 1`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VideoTransition {
+    /// Index of the clip *before* the splice.
+    pub after_clip: usize,
+    /// Transition kind.
+    pub kind: VideoTransitionKind,
+}
+
+/// Dead-air removal settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TightenSpec {
+    /// Pauses (silence or breath) longer than this inside a clip are cut out,
+    /// leaving a short natural gap. 200 ms is tight talking-head pacing.
+    #[serde(default = "default_max_silence")]
+    #[schemars(range(min = 150, max = 2000))]
+    pub max_silence_ms: u32,
+}
+
+/// Default `max_silence_ms`.
+pub const DEFAULT_MAX_SILENCE_MS: u32 = 200;
+
+fn default_max_silence() -> u32 {
+    DEFAULT_MAX_SILENCE_MS
+}
+
+impl Default for TightenSpec {
+    fn default() -> Self {
+        Self {
+            max_silence_ms: DEFAULT_MAX_SILENCE_MS,
+        }
+    }
+}
+
+/// Colour finish applied to the whole output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum ColorGrade {
+    /// Leave the source colours untouched.
+    #[default]
+    None,
+    /// Crisp phone finish: a little more contrast (+8%), saturation (+5%,
+    /// safe for skin tones) and light sharpening.
+    MobilePop,
+}
+
+/// Audio finish applied to the whole output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum AudioMix {
+    /// Keep the source levels.
+    #[default]
+    Source,
+    /// Rumble cut, gentle compression and loudness normalisation to about
+    /// -14 LUFS with peaks under -3 dBTP, so whispers and laughs stay even.
+    VoiceForward,
 }
 
 /// Caption visual preset.
@@ -241,6 +321,16 @@ pub struct OutputSpec {
     /// How the source fills the output frame.
     #[serde(default)]
     pub layout: OutputLayout,
+    /// Colour finish.
+    #[serde(default)]
+    pub grade: ColorGrade,
+    /// Audio finish.
+    #[serde(default)]
+    pub audio_mix: AudioMix,
+    /// Open with motion: the first clip scales in from 100% to 108% over
+    /// 0.4 s so the very first frame already feels alive.
+    #[serde(default)]
+    pub opening_pop: bool,
 }
 
 /// How the source picture fills the output raster.
@@ -272,6 +362,9 @@ impl Default for OutputSpec {
             aspect: AspectPreset::default(),
             height: default_height(),
             layout: OutputLayout::default(),
+            grade: ColorGrade::default(),
+            audio_mix: AudioMix::default(),
+            opening_pop: false,
         }
     }
 }
@@ -308,6 +401,104 @@ impl SemanticEdl {
             .map_or((TransitionKind::Hard, 0), |t| {
                 (t.kind, t.offset_ms.unwrap_or(JL_DEFAULT_OFFSET_MS))
             })
+    }
+
+    /// Picture transition at the splice after `clip`.
+    pub fn video_transition_after(&self, clip: usize) -> VideoTransitionKind {
+        self.video_transitions
+            .iter()
+            .find(|t| t.after_clip == clip)
+            .map_or(VideoTransitionKind::Cut, |t| t.kind)
+    }
+
+    /// Splits clips at pauses longer than `max_silence_ms` (dead-air removal).
+    ///
+    /// Returns the expanded EDL, the original clip index of every new clip,
+    /// and the total milliseconds removed. Motion cues are copied onto every
+    /// piece; audio and video transitions stay on the splice after the *last*
+    /// piece. Pauses that overlap a transcript word are never cut, no piece is
+    /// shorter than [`MIN_CLIP_MS`], and each cut keeps 60 ms of room tone on
+    /// both sides so speech never sounds clipped.
+    pub fn tightened(&self, index: &MediaIndex, max_silence_ms: u32) -> (Self, Vec<usize>, u64) {
+        const KEEP_MS: u64 = 60;
+        let mut clips = Vec::new();
+        let mut origin = Vec::new();
+        let mut removed_ms = 0_u64;
+        for (i, c) in self.clips.iter().enumerate() {
+            let mut start = c.start_ms;
+            for p in &index.audio.pauses {
+                if p.end_ms.saturating_sub(p.start_ms) <= u64::from(max_silence_ms) {
+                    continue;
+                }
+                let (ps, pe) = (p.start_ms + KEEP_MS, p.end_ms.saturating_sub(KEEP_MS));
+                if pe <= ps || ps < start + MIN_CLIP_MS || pe + MIN_CLIP_MS > c.end_ms {
+                    continue;
+                }
+                let speech = index
+                    .transcript
+                    .iter()
+                    .any(|w| w.start_ms < pe && w.end_ms > ps);
+                if speech {
+                    continue;
+                }
+                clips.push(EdlClip {
+                    start_ms: start,
+                    end_ms: ps,
+                    ..c.clone()
+                });
+                origin.push(i);
+                removed_ms += pe - ps;
+                start = pe;
+            }
+            clips.push(EdlClip {
+                start_ms: start,
+                ..c.clone()
+            });
+            origin.push(i);
+        }
+        let last_piece = |orig: usize| origin.iter().rposition(|&o| o == orig);
+        let motion_cues = origin
+            .iter()
+            .enumerate()
+            .filter_map(|(k, &o)| {
+                self.motion_cues
+                    .iter()
+                    .find(|m| m.clip == o)
+                    .map(|m| MotionCue {
+                        clip: k,
+                        ..m.clone()
+                    })
+            })
+            .collect();
+        let audio_transitions = self
+            .audio_transitions
+            .iter()
+            .filter_map(|t| {
+                last_piece(t.after_clip).map(|k| AudioTransition {
+                    after_clip: k,
+                    ..t.clone()
+                })
+            })
+            .collect();
+        let video_transitions = self
+            .video_transitions
+            .iter()
+            .filter_map(|t| {
+                last_piece(t.after_clip).map(|k| VideoTransition {
+                    after_clip: k,
+                    ..t.clone()
+                })
+            })
+            .collect();
+        let edl = Self {
+            clips,
+            motion_cues,
+            audio_transitions,
+            video_transitions,
+            tighten: None,
+            ..self.clone()
+        };
+        (edl, origin, removed_ms)
     }
 
     /// Semantic validation against a media index. Collects *every* issue.
@@ -410,6 +601,47 @@ impl SemanticEdl {
                         format!("offset_ms must be within 150..=300 (got {o})"),
                     ));
                 }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (i, t) in self.video_transitions.iter().enumerate() {
+            let p = format!("/video_transitions/{i}");
+            if t.after_clip + 1 >= n {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/after_clip"),
+                    format!(
+                        "after_clip must reference a splice (0..{})",
+                        n.saturating_sub(1)
+                    ),
+                ));
+            }
+            if !seen.insert(t.after_clip) {
+                issues.push(ValidationIssue::new(
+                    p,
+                    format!("duplicate video transition after clip {}", t.after_clip),
+                ));
+            }
+        }
+        if let Some(t) = &self.tighten
+            && !(150..=2000).contains(&t.max_silence_ms)
+        {
+            issues.push(ValidationIssue::new(
+                "/tighten/max_silence_ms",
+                "max_silence_ms must be within 150..=2000",
+            ));
+        }
+        if let Some(d) = self.headline_duration_ms {
+            if !(1000..=60000).contains(&d) {
+                issues.push(ValidationIssue::new(
+                    "/headline_duration_ms",
+                    "headline_duration_ms must be within 1000..=60000",
+                ));
+            }
+            if self.headline.is_none() {
+                issues.push(ValidationIssue::new(
+                    "/headline_duration_ms",
+                    "headline_duration_ms needs a headline",
+                ));
             }
         }
         if let Some(c) = &self.captions {

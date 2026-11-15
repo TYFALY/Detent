@@ -266,8 +266,10 @@ pub struct AssExtras<'a> {
     pub headline: Option<&'a str>,
     /// Words to emphasise (`WordBounce` only).
     pub highlight_words: &'a [String],
-    /// Timeline duration; the headline spans `0..duration_us`.
+    /// Timeline duration; the headline spans `0..duration_us` by default.
     pub duration_us: i64,
+    /// Ends the headline early (e.g. a 3-second hook banner).
+    pub headline_end_us: Option<i64>,
 }
 
 /// Renders blocks to a complete `.ass` document for a `width x height` canvas.
@@ -368,7 +370,8 @@ pub fn to_ass_with(
 ) -> String {
     let h = f64::from(height);
     let (align, margin_v) = match position {
-        CaptionPosition::Lower => (2, (h * 0.22).round()),
+        // 27% up: clear of the description and the like/comment rail.
+        CaptionPosition::Lower => (2, (h * 0.27).round()),
         CaptionPosition::Center => (5, 0.0),
         CaptionPosition::Upper => (8, (h * 0.12).round()),
     };
@@ -442,9 +445,10 @@ pub fn to_ass_with(
     ));
     out.push_str("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
     if let Some(hl) = extras.headline.filter(|h| !h.trim().is_empty()) {
-        let end = extras
+        let full = extras
             .duration_us
             .max(blocks.last().map_or(0, |b| b.end_us));
+        let end = extras.headline_end_us.map_or(full, |e| e.clamp(1, full));
         out.push_str(&format!(
             "Dialogue: 1,{},{},Headline,,0,0,0,,{}\n",
             ass_time(0),
@@ -646,6 +650,7 @@ mod tests {
                 headline: Some("Agust D's song in the new Warzone trailer"),
                 highlight_words: &hot,
                 duration_us: 5_000_000,
+                headline_end_us: None,
             },
         );
         assert!(doc.contains("Style: Headline,"));
@@ -656,6 +661,23 @@ mod tests {
         assert!(maps.contains("&H5CFF39&"));
         let two = doc.lines().find(|l| l.ends_with("TWO")).unwrap();
         assert!(!two.contains("&H5CFF39&"));
+
+        // A 3-second hook banner ends early.
+        let doc = to_ass_with(
+            &blocks,
+            CaptionStyle::WordBounce,
+            CaptionPosition::Center,
+            1080,
+            1920,
+            &AssExtras {
+                headline: Some("Hook"),
+                highlight_words: &hot,
+                duration_us: 5_000_000,
+                headline_end_us: Some(3_000_000),
+            },
+        );
+        let head = doc.lines().find(|l| l.contains(",Headline,,")).unwrap();
+        assert!(head.contains("0:00:00.00,0:00:03.00"), "{head}");
     }
 
     #[test]

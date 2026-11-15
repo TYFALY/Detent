@@ -1,8 +1,42 @@
 # detent
 
-A local-first media indexer, Semantic EDL solver and MCP video engine, written in Rust.
+**Turn a 2-hour stream, podcast or talking-head video into tight vertical clips by talking to Claude. No timeline, no cloud upload, and no cuts that land mid-word.**
+
+[![CI](https://github.com/TYFALY/detent/actions/workflows/ci.yml/badge.svg)](https://github.com/TYFALY/detent/actions/workflows/ci.yml)
+![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)
+![MCP](https://img.shields.io/badge/MCP-server-blueviolet)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
+detent is a local-first media indexer, Semantic EDL solver and [MCP](https://modelcontextprotocol.io) video engine, written in Rust.
 
 An LLM decides **what** to keep and in which order. A deterministic solver decides **exactly where** each cut lands and **how** the camera and audio move. The model never writes an FFmpeg filter, a frame number or a pixel coordinate.
+
+```text
+you:    "Find the best 45 seconds in podcast.mp4 and make it a TikTok."
+claude: index_media → picks the hook → solve_and_validate_edl → render_timeline
+detent: 5 cuts snapped into breath gaps, 0 inside words, dead air removed,
+        9:16 spring camera, word-by-word captions, voice at -14 LUFS → short.mp4
+```
+
+### What you get out of the box
+
+| Short-form craft | How detent does it |
+|---|---|
+| Cut the preamble, open on the hook | The model scores every clip's `hook_score`; the solver warns when a stronger hook is buried |
+| Kill dead air (> 0.2 s) | `tighten` splits clips at every silence or breath longer than the threshold and never touches a word |
+| Seamless conversation cuts | Automatic J/L-cuts (150-300 ms) when the audio on both sides is speech-free, plus 15-25 ms equal-power crossfades on every splice |
+| No flash frames | Cuts within 150 ms of a camera change move onto it exactly |
+| Pattern interrupts | `SpringPunchIn` zooms (1.06-1.15x) land just before vocal emphasis peaks with a critically damped spring: no overshoot, no jitter |
+| Open with motion | `opening_pop`: 100% → 108% smoothstep scale-in over the first 0.4 s |
+| 3-second hook banner | `headline` plus `headline_duration_ms: 3000`; a white box pinned at the top |
+| Captions that hold attention | 2-5 word blocks split by a line-breaking DP (never "THE HIGHEST IT / WAS"), `BoldPop`, `Karaoke` or one-word `WordBounce`, keywords in green, inside platform safe zones |
+| The right layout | `Crop` for talking heads with subject tracking; `FitBlur` / `FitBlurTall` for gameplay, screen shares and facecam streams |
+| Intentional transitions | Clean cuts by default; `Flash` (4 white frames) for kills, shocks and beat drops |
+| Phone-ready finish | `grade: MobilePop` (+8% contrast, +5% saturation, light sharpen) and `audio_mix: VoiceForward` (rumble cut, 3:1 compression, -14 LUFS, -3 dBTP peaks) |
+
+Everything runs on your machine with FFmpeg, local whisper.cpp and an optional ONNX face detector. Hardware encoding (NVENC, VideoToolbox, VA-API) is detected and verified automatically.
+
+If detent saves you an afternoon of scrubbing timelines, a ⭐ helps other people find it.
 
 ## The problem
 
@@ -144,12 +178,21 @@ The digest is sized by `DigestLimits`, so a two-hour file costs the model about 
   ],
   "motion_cues":       [ { "clip": 0, "preset": "SpringPunchIn", "intensity": "Strong" } ],
   "audio_transitions": [ { "after_clip": 0, "kind": "AutoJCut", "offset_ms": 220 } ],
-  "captions":          { "style": "BoldPop", "position": "Lower" },
-  "output":            { "aspect": "Vertical9x16", "height": 1920 }
+  "video_transitions": [ { "after_clip": 0, "kind": "Flash" } ],
+  "tighten":           { "max_silence_ms": 200 },
+  "captions":          { "style": "BoldPop", "position": "Lower",
+                         "grouping": { "min_words": 2, "max_words": 4, "max_chars": 24, "pause_break_ms": 300 } },
+  "headline":          "The mistake ruining your audio",
+  "headline_duration_ms": 3000,
+  "highlight_words":   ["mistake"],
+  "output":            { "aspect": "Vertical9x16", "height": 1920, "layout": "Crop",
+                         "opening_pop": true, "grade": "MobilePop", "audio_mix": "VoiceForward" }
 }
 ```
 
-Motion presets are `None`, `SpringPunchIn`, `SmoothTrackSubject` and `SlowCreep`. Transitions are `Hard`, `AutoJCut` and `AutoLCut` (offset 150–300 ms). Caption styles are `BoldPop`, `Minimal` and `Karaoke`. `output.layout` is `Crop` (camera crops a 9:16 window; for talking heads) or `FitBlur` (the full 16:9 frame over a blurred fill; for screen, gameplay and reaction footage, where cropping would discard the content).
+Motion presets are `None`, `SpringPunchIn`, `SmoothTrackSubject` and `SlowCreep`. Audio transitions are `Hard`, `AutoJCut` and `AutoLCut` (offset 150–300 ms); video transitions are `Cut` (default) and `Flash`. Caption styles are `BoldPop`, `Minimal`, `Karaoke` and `WordBounce`. `output.layout` is `Crop` (camera crops a 9:16 window; for talking heads), `FitBlur` (the full 16:9 frame over a blurred fill; for screen, gameplay and reaction footage, where cropping would discard the content) or `FitBlurTall` (a taller 4:5 window over the blur, for action near the centre).
+
+`tighten` runs before the solver. It splits each clip at pauses longer than `max_silence_ms`, keeps 60 ms of room tone on each side, never cuts a pause that overlaps a transcript word and never leaves a piece shorter than 300 ms. Those internal edges are pinned exactly, because snapping them into the pause valley would put the silence back. Motion cues are copied onto every piece, and transitions stay on the splice between the clips you wrote.
 
 ## The solver: math and invariants
 

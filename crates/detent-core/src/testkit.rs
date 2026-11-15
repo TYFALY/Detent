@@ -5,7 +5,7 @@
 
 use crate::edl::{
     AudioTransition, CaptionSpec, EdlClip, Intensity, MotionCue, MotionPreset, OutputSpec,
-    SemanticEdl, TransitionKind,
+    SemanticEdl, TightenSpec, TransitionKind, VideoTransition, VideoTransitionKind,
 };
 use crate::index::{
     AudioStreamInfo, AudioTelemetry, ExcitementPeak, INDEX_VERSION, MediaIndex, PauseKind,
@@ -232,6 +232,15 @@ pub fn synthetic_edl(index: &MediaIndex, clips: usize, seed: u32) -> SemanticEdl
         captions: Some(CaptionSpec::default()),
         headline: None,
         highlight_words: Vec::new(),
+        headline_duration_ms: None,
+        video_transitions: (0..clips.saturating_sub(1))
+            .step_by(2)
+            .map(|i| VideoTransition {
+                after_clip: i,
+                kind: VideoTransitionKind::Flash,
+            })
+            .collect(),
+        tighten: clips.is_multiple_of(2).then(TightenSpec::default),
         output: OutputSpec::default(),
         clips: clips_v,
     }
@@ -248,7 +257,11 @@ mod tests {
         idx.validate().unwrap();
         let edl = synthetic_edl(&idx, 12, 3);
         let res = EdlSolver::default().solve(&edl, &idx).unwrap();
-        assert_eq!(res.timeline.segments.len(), 12);
+        // Even clip counts enable `tighten`, so clips may be split at pauses.
+        let segs = &res.timeline.segments;
+        assert!(segs.len() >= 12);
+        assert!(segs.windows(2).all(|w| w[0].clip_index <= w[1].clip_index));
+        assert_eq!(segs.last().unwrap().clip_index, 11);
         assert!(res.timeline.captions.unwrap().blocks.len() > 20);
     }
 
