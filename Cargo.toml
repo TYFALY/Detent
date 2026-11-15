@@ -7,6 +7,7 @@ members = [
     "crates/detent-mcp",
     "crates/detent-cli",
 ]
+exclude = ["vendor"]
 default-members = [
     "crates/detent-core",
     "crates/detent-indexer",
@@ -61,3 +62,9 @@ codegen-units = 1
 
 [profile.bench]
 debug = false
+
+# whisper-rs 0.16 / whisper-rs-sys 0.15 with fixes for x86_64-pc-windows-gnu
+# (see vendor/README.md). Only the CPU and BLAS ggml backends are vendored.
+[patch.crates-io]
+whisper-rs = { path = "vendor/whisper-rs" }
+whisper-rs-sys = { path = "vendor/whisper-rs-sys" }

@@ -394,26 +394,83 @@ fn j_cut_applied_when_both_sides_are_silent() {
 }
 
 #[test]
-fn l_cut_downgraded_when_speech_follows() {
+fn l_cut_moves_the_picture_when_speech_follows() {
     let idx = talk();
-    // Clip 0 ends right before "This" at 3000: extending audio would leak speech.
+    // Clip 0 ends right before "This" at 3000: extending its audio would leak
+    // speech, but clip 1's pre-roll (5150-5300) is silent, so the picture cut
+    // moves earlier instead and the audio is untouched.
     let mut e = edl(vec![clip(950, 2_990), clip(5_300, 6_700)]);
+    let hard = EdlSolver::default().solve(&e, &idx).unwrap();
     e.audio_transitions.push(AudioTransition {
         after_clip: 0,
         kind: TransitionKind::AutoLCut,
         offset_ms: Some(300),
     });
     let res = EdlSolver::default().solve(&e, &idx).unwrap();
-    let out = res.report.cuts[0].video_ms.1;
-    if out + 150 > 2_980 {
-        assert_eq!(res.timeline.splices[0].av_offset_us, 0);
-        assert!(
-            res.report
-                .diagnostics
-                .iter()
-                .any(|d| d.code == "jl_downgraded")
-        );
+    let t = &res.timeline;
+    assert!(t.verify().is_empty(), "{:?}", t.verify());
+    let applied = res.report.adjustments.iter().find_map(|a| match a {
+        Adjustment::LCut {
+            offset_ms,
+            picture_side,
+            ..
+        } => Some((*offset_ms, *picture_side)),
+        _ => None,
+    });
+    let (offset_ms, picture_side) = applied.unwrap_or_else(|| panic!("{:?}", res.report));
+    assert!(picture_side);
+    assert!((150..=300).contains(&offset_ms), "{offset_ms}");
+    assert!(t.splices[0].av_offset_us < 0);
+    // Audio is exactly where the hard cut put it; only the picture moved.
+    for (s, h) in t.segments.iter().zip(&hard.timeline.segments) {
+        assert_eq!(s.audio, h.audio);
     }
+    assert!(t.segments[1].video.start_us < hard.timeline.segments[1].video.start_us);
+    assert!(t.segments[1].video.start_us >= 4_620_000);
+}
+
+#[test]
+fn j_cut_moves_the_picture_when_the_next_clip_starts_mid_speech() {
+    let idx = talk();
+    // Clip 1 starts on "is": its pre-roll holds "This", so the audio cannot
+    // lead. Clip 0's post-roll (inside the 2200-3000 pause) is silent, so its
+    // picture is held over the start of clip 1's audio instead.
+    let mut e = edl(vec![clip(950, 2_400), clip(3_290, 4_700)]);
+    e.audio_transitions.push(AudioTransition {
+        after_clip: 0,
+        kind: TransitionKind::AutoJCut,
+        offset_ms: Some(250),
+    });
+    let res = EdlSolver::default().solve(&e, &idx).unwrap();
+    assert!(res.timeline.verify().is_empty());
+    let picture_side = res.report.adjustments.iter().find_map(|a| match a {
+        Adjustment::JCut { picture_side, .. } => Some(*picture_side),
+        _ => None,
+    });
+    assert_eq!(picture_side, Some(true), "{:?}", res.report);
+    let s0 = &res.timeline.segments[0];
+    assert!(s0.video.end_us > s0.audio.end_us);
+}
+
+#[test]
+fn j_l_downgraded_when_speech_is_continuous_on_both_sides() {
+    let idx = talk();
+    // Clip 0 ends right before "This" and clip 1 starts on "is": neither
+    // the audio nor the picture can move without crossing a word.
+    let mut e = edl(vec![clip(950, 2_990), clip(3_290, 4_700)]);
+    e.audio_transitions.push(AudioTransition {
+        after_clip: 0,
+        kind: TransitionKind::AutoJCut,
+        offset_ms: Some(300),
+    });
+    let res = EdlSolver::default().solve(&e, &idx).unwrap();
+    assert_eq!(res.timeline.splices[0].av_offset_us, 0, "{:?}", res.report);
+    assert!(
+        res.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "jl_downgraded")
+    );
 }
 
 #[test]
@@ -735,8 +792,9 @@ proptest! {
             prop_assert!(s.video.frames() > 0);
             prop_assert!(s.audio.len_us() > 0);
             // Cuts move at most snap tolerance + scene guard + one frame,
-            // unless the collapse fallback restored the request.
-            let slack = (350 + 150) * 1_000 + fps.frame_duration_us();
+            // unless the collapse fallback restored the request, plus up to
+            // 300 ms when a picture-side J/L cut moved the video splice.
+            let slack = (350 + 150 + 300) * 1_000 + fps.frame_duration_us();
             prop_assert!((s.video.start_us - c.start_ms as i64 * 1_000).abs() <= slack);
             prop_assert!((s.video.end_us - (c.end_ms as i64 * 1_000)).abs() <= slack);
         }

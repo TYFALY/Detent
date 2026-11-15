@@ -75,3 +75,33 @@ jobs:
       - run: cargo clippy -p detent-indexer --features whisper --all-targets -- -D warnings
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
+  native-whisper-windows-gnu:
+    name: whisper adapter builds and runs (Windows GNU)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-clang
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      # Links whisper.cpp through the patched vendor/ crates and runs the test
+      # binary. It skips without a model, but a broken link or a missing DLL
+      # entry point still fails here.
+      - run: cargo +stable-x86_64-pc-windows-gnu test -p detent-indexer --features whisper --test whisper_native
+        env:
+          CMAKE_GENERATOR: Ninja
+          LIBCLANG_PATH: ${{ steps.msys2.outputs.msys2-location }}\mingw64\bin

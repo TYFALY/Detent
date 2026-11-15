@@ -13,7 +13,10 @@
 //!    neighbour that does not clip a word.
 //! 4. **J/L-cut injection** — requested splices shift the audio cut by the
 //!    largest offset in `[150, target]` ms whose removed *and* inserted audio
-//!    are speech-free; otherwise the splice is downgraded to `Hard`.
+//!    are speech-free. When speech is continuous on one side, the *picture*
+//!    cut moves instead (audio untouched), which needs only the extra frames
+//!    to be speech-free and inside one shot; otherwise the splice is
+//!    downgraded to `Hard`.
 //! 5. **Micro-crossfades** — every splice gets an equal-power crossfade
 //!    (15–25 ms) centred on the audio cut, using handles taken from the
 //!    source so total audio length stays identical to total video length.
@@ -142,6 +145,10 @@ pub enum Adjustment {
         offset_ms: u32,
         /// Offset requested (ms).
         requested_ms: u32,
+        /// True when the picture cut moved instead of the audio cut (only
+        /// one side of the splice had a speech-free window).
+        #[serde(default)]
+        picture_side: bool,
     },
     /// L-cut applied (audio trails the picture).
     LCut {
@@ -151,6 +158,10 @@ pub enum Adjustment {
         offset_ms: u32,
         /// Offset requested (ms).
         requested_ms: u32,
+        /// True when the picture cut moved instead of the audio cut (only
+        /// one side of the splice had a speech-free window).
+        #[serde(default)]
+        picture_side: bool,
     },
     /// Crossfade shortened because the source ran out of handle.
     CrossfadeShortened {
@@ -386,7 +397,25 @@ impl EdlSolver {
                 continue;
             }
             let prev = if k == 0 { 0 } else { offsets[k - 1] };
-            match self.find_jl_offset(index, &video_ranges, k, kind, target_ms, prev) {
+            let mut picture_side = false;
+            let found = self
+                .find_jl_offset(index, &video_ranges, k, kind, target_ms, prev)
+                .or_else(|| {
+                    let (o, a, b) = self.find_picture_shift(
+                        index,
+                        fps,
+                        &video_ranges,
+                        k,
+                        kind,
+                        target_ms,
+                        (min_frames, total_frames),
+                    )?;
+                    video_ranges[k] = a;
+                    video_ranges[k + 1] = b;
+                    picture_side = true;
+                    Some(o)
+                });
+            match found {
                 Some(o) => {
                     offsets[k] = o;
                     let offset_ms = us_to_ms(o.abs()) as u32;
@@ -395,12 +424,14 @@ impl EdlSolver {
                             splice: k,
                             offset_ms,
                             requested_ms: target_ms,
+                            picture_side,
                         }
                     } else {
                         Adjustment::LCut {
                             splice: k,
                             offset_ms,
                             requested_ms: target_ms,
+                            picture_side,
                         }
                     });
                 }
@@ -409,7 +440,7 @@ impl EdlSolver {
                     "jl_downgraded",
                     Some(k),
                     format!(
-                        "{kind:?} after clip {k} downgraded to Hard: speech is continuous on both sides of the splice (no speech-free {}-{target_ms} ms window); a micro-crossfade is still applied",
+                        "{kind:?} after clip {k} downgraded to Hard: no speech-free {}-{target_ms} ms window on either side of the splice (the audio side needs both, the picture side needs the extra frames to be silent and inside one shot); a micro-crossfade is still applied",
                         crate::edl::JL_OFFSET_RANGE_MS.start()
                     ),
                 ),
@@ -969,6 +1000,65 @@ impl EdlSolver {
                 && index.audio_range_is_safe(removed, guard)
                 && index.audio_range_is_safe(added, guard))
             .then_some(signed)
+        })
+    }
+
+    /// Picture-side J/L: keeps the audio splice where breath snapping put it
+    /// and moves the *video* splice instead, so no audio is removed or
+    /// inserted. A J-cut holds clip `k`'s picture past its out point (its
+    /// post-roll is shown under the next clip's first words); an L-cut starts
+    /// the next clip's picture early (its pre-roll is shown under the end of
+    /// clip `k`). Only those extra frames must be speech-free (a closed mouth)
+    /// and inside a single shot, so this works when speech is continuous on
+    /// the other side. Returns the signed offset and the two new ranges.
+    #[allow(clippy::too_many_arguments)]
+    fn find_picture_shift(
+        &self,
+        index: &MediaIndex,
+        fps: FrameRate,
+        v: &[FrameRange],
+        k: usize,
+        kind: TransitionKind,
+        target_ms: u32,
+        (min_frames, total_frames): (i64, i64),
+    ) -> Option<(i64, FrameRange, FrameRange)> {
+        let lo = *crate::edl::JL_OFFSET_RANGE_MS.start();
+        let target = target_ms.clamp(lo, *crate::edl::JL_OFFSET_RANGE_MS.end());
+        let guard = ms_to_us(u64::from(self.config.word_guard_ms));
+        let (a, b) = (v[k], v[k + 1]);
+        let mut lo_frames = fps.nearest_frame(ms_to_us(u64::from(lo))).max(1);
+        while fps.frame_to_us(lo_frames) < ms_to_us(u64::from(lo)) {
+            lo_frames += 1;
+        }
+        let hi_frames = fps.floor_frame(ms_to_us(u64::from(target)));
+        // A shot boundary at frame `f` inside `frames` would flash a new shot.
+        let crosses_shot = |frames: std::ops::Range<i64>| {
+            index
+                .visual
+                .shots
+                .iter()
+                .any(|s| frames.contains(&(s.frame as i64)))
+        };
+        (lo_frames..=hi_frames).rev().find_map(|d| match kind {
+            TransitionKind::AutoJCut => {
+                let na = FrameRange::new(a.start_frame, a.end_frame + d, fps);
+                let nb = FrameRange::new(b.start_frame + d, b.end_frame, fps);
+                (na.end_frame <= total_frames
+                    && nb.frames() >= min_frames
+                    && !crosses_shot(a.end_frame..na.end_frame)
+                    && index.audio_range_is_safe(UsRange::new(a.end_us, na.end_us), guard))
+                .then(|| (na.end_us - a.end_us, na, nb))
+            }
+            TransitionKind::AutoLCut => {
+                let na = FrameRange::new(a.start_frame, a.end_frame - d, fps);
+                let nb = FrameRange::new(b.start_frame - d, b.end_frame, fps);
+                (nb.start_frame >= 0
+                    && na.frames() >= min_frames
+                    && !crosses_shot(nb.start_frame + 1..b.start_frame + 1)
+                    && index.audio_range_is_safe(UsRange::new(nb.start_us, b.start_us), guard))
+                .then(|| (-(a.end_us - na.end_us), na, nb))
+            }
+            TransitionKind::Hard => None,
         })
     }
 }

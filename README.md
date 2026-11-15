@@ -24,7 +24,7 @@ detent: 5 cuts snapped into breath gaps, 0 inside words, dead air removed,
 |---|---|
 | Cut the preamble, open on the hook | The model scores every clip's `hook_score`; the solver warns when a stronger hook is buried |
 | Kill dead air (> 0.2 s) | `tighten` splits clips at every silence or breath longer than the threshold and never touches a word |
-| Seamless conversation cuts | Automatic J/L-cuts (150-300 ms) when the audio on both sides is speech-free, plus 15-25 ms equal-power crossfades on every splice |
+| Seamless conversation cuts | Automatic J/L-cuts (150-300 ms): the audio cut moves when both sides have a pause, the picture cut moves when only one side does, plus 15-25 ms equal-power crossfades on every splice |
 | No flash frames | Cuts within 150 ms of a camera change move onto it exactly |
 | Pattern interrupts | `SpringPunchIn` zooms (1.06-1.15x) land just before vocal emphasis peaks with a critically damped spring: no overshoot, no jitter |
 | Open with motion | `opening_pop`: 100% → 108% smoothstep scale-in over the first 0.4 s |
@@ -125,7 +125,7 @@ export ORT_DYLIB_PATH=/path/to/libonnxruntime.so DETENT_FACE_MODEL=/path/to/vers
 detent index talk.mp4
 ```
 
-The same variables configure the MCP server. On Linux or macOS with CMake and libclang, `--features whisper` links whisper.cpp natively instead of using the subprocess.
+The same variables configure the MCP server. With CMake, a C++ compiler and libclang, `--features whisper` links whisper.cpp natively instead of using the subprocess. This works on Linux, macOS, Windows MSVC and Windows MinGW; the MinGW fixes live in [`vendor/`](vendor/README.md).
 
 `detent solve` prints every cut it resolved, every automatic adjustment, and every request it could not honour. Here is real output from the edit described in *Real-footage results* below:
 
@@ -211,7 +211,7 @@ a_in(i)  = v_in(i)  − o(i−1)
 a_out(i) = v_out(i) − o(i)
 ```
 
-Lip sync is preserved inside every clip, and Σ audio = Σ video telescopically. The solver tries the requested offset, then shorter ones in 10 ms steps down to 150 ms, and accepts the first offset for which both the audio *removed* and the audio *inserted* are speech-free (or inside detected pauses when there is no transcript). If none qualifies, the splice is downgraded to `Hard` with a diagnostic.
+Lip sync is preserved inside every clip, and Σ audio = Σ video telescopically. The solver tries the requested offset, then shorter ones in 10 ms steps down to 150 ms, and accepts the first offset for which both the audio *removed* and the audio *inserted* are speech-free (or inside detected pauses when there is no transcript). If none qualifies, it tries the **picture side**: the audio splice stays where breath snapping put it and the video splice moves instead (a J-cut holds the outgoing picture over the next clip's first words; an L-cut shows the incoming picture early). That only needs the extra frames to be speech-free (a closed mouth) and inside one shot, so it works when speech is continuous on the other side. The same formula applies with the shifted video ranges, so no audio is removed or inserted. Only when both sides are continuous speech is the splice downgraded to `Hard`, with a diagnostic.
 
 **5. Micro-crossfades (15–25 ms).** Every splice gets an equal-power crossfade (`qsin`/`qsin`, so sin² + cos² = 1). It is centred on the audio cut by extending both sides by `c/2` of real source audio. That makes `Σ audio − Σ crossfades = Σ video` hold **exactly** in microseconds, so the A/V offset never accumulates.
 
@@ -316,7 +316,7 @@ cargo bench -p detent-core -p detent-indexer
 | `solver/solve/32_clips` | 976 µs | |
 | `captions/chunk_1000_words` | 257 µs | |
 | `vision/shot_detector_160x90` (300 frames, cuts + dissolves) | 17.8 ms | 16.8 k frames/s |
-| `vision/saliency_160x90` (300 frames) | 49.1 ms | 6.1 k frames/s |
+| `vision/saliency_160x90` (300 frames) | 39.7 ms | 7.6 k frames/s |
 
 Indexing is bound by H.264 decoding in FFmpeg; the analysis itself (DSP, histograms, saliency on 160 px frames) is a small fraction of the wall time. Rendering with zoom is bound by the per-frame bicubic `scale` that implements sub-pixel zoom on the CPU, not by the encoder.
 
@@ -330,11 +330,11 @@ cargo test --workspace
 |---|---|
 | `detent-core` unit tests | DSP (−3 dBFS sine, chunk-size invariance, silence/breath placement, peak spacing), rational time, EDL strictness and schema, spring closed form, RDP, captions, `.ass` escaping |
 | `detent-core` property tests | spring: no overshoot, target-hull containment, monotone tracking; camera: bounded crops and exact aspect; RDP error bound; captions: order, size and weak-ending rules; **solver**: every invariant above for random indices/EDLs (5 frame rates, any aspect, ± transcript/audio), bounded cut movement, determinism |
-| `detent-indexer` | ffprobe parsing (rotation, cover art, NTSC rates), shot detector, saliency tracking, chunked ASR windowing, contact sheets, dissolve and fade-through-black detection (and no false hits on drift or slow pans); **FFmpeg integration**: a synthetic MP4 is cut at exactly frame 75 and its silent gap is found within 50 ms; a real `xfade` dissolve and `fadeblack` are each found once |
+| `detent-indexer` | ffprobe parsing (rotation, cover art, NTSC rates), shot detector, saliency tracking (follows one of two people instead of the gap between them, and switches exactly once when the other starts moving), chunked ASR windowing, contact sheets, dissolve and fade-through-black detection (and no false hits on drift or slow pans); **FFmpeg integration**: a synthetic MP4 is cut at exactly frame 75 and its silent gap is found within 50 ms; a real `xfade` dissolve and `fadeblack` are each found once; **native whisper** transcribes synthesised speech (gated on `DETENT_WHISPER_MODEL`) |
 | `detent-renderer` | encoder discovery parsing, filtergraph golden tests, hinge-expression property test; **end-to-end**: index → solve (punch-in, tracking, L-cut, captions) → render has **exactly** the solved frame count, with audio within 50 ms of video; stream-copy preview; tampered timelines rejected; **batched rendering** (1 and 3 segments per process) gives the same frame count and A/V length as a single pass |
 | `detent-mcp` | spawns the real binary and speaks JSON-RPC over stdio: initialize, tools/list, a hallucinated field rejected, index → validation issues → solve → render → inspect |
 
-Tests that need FFmpeg skip with a message when it is not installed. CI runs `fmt`, `clippy -D warnings`, tests on Linux (with FFmpeg), macOS and Windows, a one-shot run of every benchmark, a Linux job that compiles the `whisper` and `onnx` adapters, and a Windows MSVC job that compiles `whisper`.
+Tests that need FFmpeg skip with a message when it is not installed. CI runs `fmt`, `clippy -D warnings`, tests on Linux (with FFmpeg), macOS and Windows, a one-shot run of every benchmark, a Linux job that compiles the `whisper` and `onnx` adapters, and Windows MSVC and MinGW jobs that build `whisper` (the MinGW job also links and runs the native whisper test).
 
 ## Feature flags (`detent-indexer`)
 
@@ -347,10 +347,8 @@ Tests that need FFmpeg skip with a message when it is not installed. CI runs `fm
 
 ## Limitations
 
-- The default subject tracker is a heuristic (motion energy, YCbCr skin prior and centre bias). It works for single-subject footage. Use `onnx` for real face detection; against ONNX Runtime 1.24.4 it found 42 faces in a ~50-person group photo, and the gated `onnx_faces` test checks box sanity and subject stability on real photos.
-- On Windows, the native `whisper` feature needs the MSVC toolchain (CI builds it on `windows-latest`). Under `x86_64-pc-windows-gnu`, whisper-rs 0.16 has three separate upstream bugs: an MSVC-only `/utf-8` flag, `ggml.a` library naming and enum signedness. The default `whisper-cli` path works on every toolchain.
-
-- J/L cuts need speech-free audio on both sides of a splice. In continuous speech the solver honestly downgrades them to hard cuts with a micro-crossfade rather than leaking a neighbouring word.
+- The default subject tracker is still a heuristic, not a face detector. It splits motion and skin-tone saliency into blobs and follows one subject with hysteresis, preferring whoever moves. In a two-person shot it frames a person rather than the wall between them, but it can mistake a gesturing hand for a head. Use `onnx` for real face detection; against ONNX Runtime 1.24.4 it found 42 faces in a ~50-person group photo, and the gated `onnx_faces` test checks box sanity and subject stability on real photos.
+- A J/L cut is downgraded to a hard cut (with a micro-crossfade) only when speech is continuous on *both* sides of the splice, so neither the audio nor the picture can move without leaking or dropping a word.
 
 ## License
 
