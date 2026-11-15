@@ -204,6 +204,7 @@ pub fn run(input: Option<&Path>, seconds: f32) -> Result<()> {
                 quality: Quality::Standard,
                 encoder: enc,
                 mode: RenderMode::Full,
+                batch_segments: None,
             },
             &mut |_| {},
         )?;

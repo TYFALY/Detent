@@ -104,3 +104,60 @@ fn renders_range_contact_sheet() {
     let img = image::open(&out).unwrap();
     assert_eq!(img.width(), 3 * 96);
 }
+
+/// A real FFmpeg cross-dissolve (0.8 s from 2.6 s) and a fade through
+/// black (0.8 s from 4.8 s) are each found once, mid-transition.
+#[test]
+fn finds_dissolves_and_fades() {
+    let tools = FfmpegTools::from_env();
+    if !tools.available() {
+        eprintln!("skipping: ffmpeg/ffprobe not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("dissolve.mp4");
+    let graph = "testsrc2=s=320x180:r=25:d=3.4[a];\
+mandelbrot=s=320x180:r=25,trim=duration=3,setpts=PTS-STARTPTS[b];\
+smptehdbars=s=320x180:r=25:d=2[c];\
+[a][b]xfade=transition=fade:duration=0.8:offset=2.6[ab];\
+[ab][c]xfade=transition=fadeblack:duration=0.8:offset=4.8[v]";
+    let ok = Command::new(&tools.ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-filter_complex",
+            graph,
+            "-map",
+            "[v]",
+        ])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&out)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipping: lavfi sources unavailable");
+        return;
+    }
+    let out = index_file(
+        &tools,
+        &out,
+        &mut NoTranscript,
+        &mut SaliencyTracker::new(200),
+        &IndexOptions::default(),
+    )
+    .unwrap();
+    let ms: Vec<u64> = out.index.visual.shots.iter().map(|s| s.t_ms).collect();
+    assert_eq!(ms.len(), 2, "{:?}", out.index.visual.shots);
+    // Transition centres: 3.0 s and 5.2 s.
+    assert!(ms[0].abs_diff(3_000) <= 280, "{ms:?}");
+    assert!(ms[1].abs_diff(5_200) <= 280, "{ms:?}");
+}

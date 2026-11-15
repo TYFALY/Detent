@@ -10,9 +10,9 @@ use detent_core::captions::{AssExtras, to_ass_with};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::encoder::{EncoderChoice, FfmpegInfo, Quality, Tools};
+use crate::encoder::{Encoder, EncoderChoice, FfmpegInfo, Quality, Tools};
 use crate::error::{RenderError, Result, io_err};
-use crate::graph::compile;
+use crate::graph::{BATCH_SEGMENTS, InputSpec, batches, compile, compile_batch, compile_join};
 
 /// Render mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
@@ -35,6 +35,10 @@ pub struct RenderOptions {
     pub encoder: EncoderChoice,
     /// Mode.
     pub mode: RenderMode,
+    /// Segments per FFmpeg process (`None`: [`BATCH_SEGMENTS`]). Longer
+    /// timelines are rendered in lossless batches and joined, so very long
+    /// EDLs never open hundreds of inputs at once.
+    pub batch_segments: Option<usize>,
 }
 
 /// Live progress sample.
@@ -153,29 +157,128 @@ impl Renderer {
             }
             _ => None,
         };
-        let graph = compile(t, encoder, ass);
-        let graph_path = work.path().join("graph.txt");
-        std::fs::write(&graph_path, &graph.filter).map_err(io_err(&graph_path))?;
+        let n = t.segments.len();
+        let batch = opts.batch_segments.unwrap_or(BATCH_SEGMENTS).max(1);
+        let started = Instant::now();
+        let expected: i64 = t.segments.iter().map(|s| s.video.frames()).sum();
 
-        let mut cmd = Command::new(&self.info.tools.ffmpeg);
-        cmd.current_dir(work.path())
-            .args(["-nostdin", "-hide_banner", "-v", "error", "-y"])
-            .args(encoder.global_args());
-        for input in &graph.inputs {
-            cmd.arg("-ss")
-                .arg(format!("{:.6}", input.seek_s))
-                .arg("-t")
-                .arg(format!("{:.6}", input.duration_s))
-                .arg("-i")
-                .arg(&t.source.path);
-        }
-        if self.info.supports_option_files() {
-            cmd.args(["-/filter_complex", "graph.txt"]);
+        let mut m = if n <= batch {
+            let graph = compile(t, encoder, ass);
+            let mut cmd = self.command(work.path(), "graph.txt", &graph.filter)?;
+            cmd.args(encoder.global_args());
+            for input in &graph.inputs {
+                source_input(&mut cmd, input, &t.source.path);
+            }
+            self.encode_args(&mut cmd, "graph.txt", graph.has_audio, t, encoder, opts);
+            let mut m = run_with_progress(cmd, output, t.duration_us, on_progress)?;
+            m.mode = "filtergraph".into();
+            m
         } else {
-            cmd.args(["-filter_complex_script", "graph.txt"]);
+            // Long EDLs: a bounded number of seeked inputs per process.
+            // Each batch is rendered losslessly (FFV1 + float PCM in NUT,
+            // which keeps exact timestamps), then one join pass applies the
+            // cross-batch crossfades, grade, captions and the final encode.
+            let ranges = batches(n, batch);
+            let total_us = t.duration_us.max(1);
+            let mut done_us = 0_i64;
+            for (k, r) in ranges.iter().enumerate() {
+                let graph = compile_batch(t, r.clone());
+                let script = format!("batch{k}.txt");
+                let mut cmd = self.command(work.path(), &script, &graph.filter)?;
+                for input in &graph.inputs {
+                    source_input(&mut cmd, input, &t.source.path);
+                }
+                self.filter_arg(&mut cmd, &script);
+                cmd.args(["-map", "[vout]", "-c:v", "ffv1", "-level", "3"]);
+                if graph.has_audio {
+                    cmd.args(["-map", "[aout]", "-c:a", "pcm_f32le"]);
+                }
+                cmd.args(["-fps_mode", "passthrough", "-f", "nut"]);
+                let part_us: i64 = t.segments[r.clone()].iter().map(|s| s.video.len_us()).sum();
+                let part_frames: i64 = t.segments[r.clone()].iter().map(|s| s.video.frames()).sum();
+                let path = work.path().join(format!("batch{k}.nut"));
+                let base = done_us;
+                let pm = run_with_progress(cmd, &path, part_us, &mut |p| {
+                    let at = base + p.out_time_us;
+                    on_progress(Progress {
+                        frames: p.frames,
+                        out_time_us: at,
+                        fraction: (0.5 * at as f64 / total_us as f64).clamp(0.0, 0.5),
+                    });
+                })?;
+                if pm.frames != part_frames as u64 {
+                    return Err(RenderError::FrameCountMismatch {
+                        expected: part_frames as u64,
+                        written: pm.frames,
+                    });
+                }
+                done_us += part_us;
+            }
+            let graph = compile_join(t, &ranges, encoder, ass);
+            let mut cmd = self.command(work.path(), "join.txt", &graph.filter)?;
+            cmd.args(encoder.global_args());
+            for k in 0..ranges.len() {
+                cmd.arg("-i").arg(format!("batch{k}.nut"));
+            }
+            self.encode_args(&mut cmd, "join.txt", graph.has_audio, t, encoder, opts);
+            let mut m = run_with_progress(cmd, output, t.duration_us, &mut |p| {
+                on_progress(Progress {
+                    fraction: 0.5 + 0.5 * p.fraction,
+                    ..p
+                });
+            })?;
+            let wall = started.elapsed().as_secs_f64();
+            m.wall_ms = (wall * 1_000.0).round() as u64;
+            if wall > 0.0 {
+                m.encode_fps = m.frames as f64 / wall;
+                m.realtime_factor = t.duration_us as f64 / 1e6 / wall;
+            }
+            m.mode = "filtergraph_batched".into();
+            m
+        };
+        // Defence in depth: FFmpeg can silently drop frames (e.g. a filter
+        // expression failing at runtime). A short file is an error, not a result.
+        if m.frames != expected as u64 {
+            return Err(RenderError::FrameCountMismatch {
+                expected: expected as u64,
+                written: m.frames,
+            });
         }
+        m.encoder = Some(encoder.ffmpeg_name().into());
+        Ok(m)
+    }
+
+    /// An FFmpeg command in `dir` with `filter` written to `script`.
+    fn command(&self, dir: &Path, script: &str, filter: &str) -> Result<Command> {
+        let p = dir.join(script);
+        std::fs::write(&p, filter).map_err(io_err(&p))?;
+        let mut cmd = Command::new(&self.info.tools.ffmpeg);
+        cmd.current_dir(dir)
+            .args(["-nostdin", "-hide_banner", "-v", "error", "-y"]);
+        Ok(cmd)
+    }
+
+    fn filter_arg(&self, cmd: &mut Command, script: &str) {
+        if self.info.supports_option_files() {
+            cmd.arg("-/filter_complex").arg(script);
+        } else {
+            cmd.arg("-filter_complex_script").arg(script);
+        }
+    }
+
+    /// Filter script, stream maps and the final encode settings.
+    fn encode_args(
+        &self,
+        cmd: &mut Command,
+        script: &str,
+        has_audio: bool,
+        t: &ResolvedTimeline,
+        encoder: Encoder,
+        opts: &RenderOptions,
+    ) {
+        self.filter_arg(cmd, script);
         cmd.args(["-map", "[vout]"]);
-        if graph.has_audio {
+        if has_audio {
             cmd.args([
                 "-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             ]);
@@ -184,19 +287,6 @@ impl Renderer {
             .arg("-r")
             .arg(format!("{}/{}", t.output.fps.num, t.output.fps.den))
             .args(["-fps_mode", "cfr", "-movflags", "+faststart"]);
-        let mut m = run_with_progress(cmd, output, t.duration_us, on_progress)?;
-        // Defence in depth: FFmpeg can silently drop frames (e.g. a filter
-        // expression failing at runtime). A short file is an error, not a result.
-        let expected: i64 = t.segments.iter().map(|s| s.video.frames()).sum();
-        if m.frames != expected as u64 {
-            return Err(RenderError::FrameCountMismatch {
-                expected: expected as u64,
-                written: m.frames,
-            });
-        }
-        m.mode = "filtergraph".into();
-        m.encoder = Some(encoder.ffmpeg_name().into());
-        Ok(m)
     }
 
     fn stream_copy(
@@ -251,6 +341,15 @@ pub fn copy_eligible(t: &ResolvedTimeline) -> bool {
         || o.audio_mix != detent_core::edl::AudioMix::Source
         || t.splices.iter().any(|s| s.flash);
     !finishing && !t.needs_reframe() && t.captions.as_ref().is_none_or(|c| c.blocks.is_empty())
+}
+
+fn source_input(cmd: &mut Command, input: &InputSpec, src: &str) {
+    cmd.arg("-ss")
+        .arg(format!("{:.6}", input.seek_s))
+        .arg("-t")
+        .arg(format!("{:.6}", input.duration_s))
+        .arg("-i")
+        .arg(src);
 }
 
 fn absolute(p: &Path) -> Result<PathBuf> {

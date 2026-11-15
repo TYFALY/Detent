@@ -61,3 +61,17 @@ jobs:
       # whisper-rs builds whisper.cpp with CMake and generates bindings with libclang.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
       - run: cargo clippy -p detent-indexer --features whisper,onnx --all-targets -- -D warnings
+
+  native-whisper-windows:
+    name: whisper adapter compiles (Windows MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The runner ships MSVC, CMake and LLVM (libclang for bindgen).
+      - run: cargo clippy -p detent-indexer --features whisper --all-targets -- -D warnings
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin

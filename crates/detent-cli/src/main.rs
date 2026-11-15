@@ -314,6 +314,7 @@ fn render(
         } else {
             RenderMode::Full
         },
+        batch_segments: None,
     };
     let mut stderr = std::io::stderr();
     let m = renderer.render(&t, out, &opts, &mut |p| {

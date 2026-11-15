@@ -501,6 +501,7 @@ reframing or captions are needed. Returns throughput metrics."
                 quality: p.quality,
                 encoder: p.encoder.map_or(EncoderChoice::Auto, EncoderChoice::Force),
                 mode: p.mode,
+                batch_segments: None,
             };
             Ok(renderer.render(&t, Path::new(&p.output_path), &opts, &mut |_| {})?)
         })

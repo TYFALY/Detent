@@ -170,6 +170,7 @@ fn full_render_is_frame_exact() {
                 quality: Quality::Draft,
                 encoder: EncoderChoice::Force(Encoder::Libx264),
                 mode: RenderMode::Full,
+                batch_segments: None,
             },
             &mut |_| updates += 1,
         )
@@ -230,6 +231,7 @@ fn finishing_effects_keep_frames_and_sync() {
                     quality: Quality::Draft,
                     encoder: EncoderChoice::Force(Encoder::Libx264),
                     mode: RenderMode::Full,
+                    batch_segments: None,
                 },
                 &mut |_| {},
             )
@@ -310,4 +312,74 @@ fn rejects_tampered_timeline() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("invalid timeline"), "{err}");
+}
+
+#[test]
+fn batched_render_matches_single_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(src) = fixture(dir.path()) else {
+        return;
+    };
+    let mut e = edl();
+    e.clips = [(6_150, 8_000), (250, 1_500), (1_700, 3_450), (4_000, 5_500)]
+        .into_iter()
+        .map(|(start_ms, end_ms)| EdlClip {
+            start_ms,
+            end_ms,
+            hook_score: 0.5,
+            editorial_note: String::new(),
+        })
+        .collect();
+    e.motion_cues.retain(|c| c.clip < 4);
+    e.headline = Some("Batched".into());
+    e.video_transitions = vec![VideoTransition {
+        after_clip: 1,
+        kind: VideoTransitionKind::Flash,
+    }];
+    e.output.grade = ColorGrade::MobilePop;
+    e.output.audio_mix = AudioMix::VoiceForward;
+    e.output.opening_pop = true;
+    let t = solve(&src, dir.path(), &e);
+    assert!(t.segments.len() >= 4);
+    let renderer = Renderer::new(Tools::default()).unwrap();
+    let mut durations = Vec::new();
+    for batch in [None, Some(1), Some(3)] {
+        let out = dir.path().join(format!("batch-{batch:?}.mp4"));
+        let m = renderer
+            .render(
+                &t,
+                &out,
+                &RenderOptions {
+                    quality: Quality::Draft,
+                    encoder: EncoderChoice::Force(Encoder::Libx264),
+                    mode: RenderMode::Full,
+                    batch_segments: batch,
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        let want = if batch.is_some() {
+            "filtergraph_batched"
+        } else {
+            "filtergraph"
+        };
+        assert_eq!(m.mode, want);
+        let p = probe(&out);
+        let v = stream(&p, "video");
+        let expected: i64 = t.segments.iter().map(|s| s.video.frames()).sum();
+        let got: i64 = v["nb_read_frames"].as_str().unwrap().parse().unwrap();
+        assert_eq!(got, expected, "batch {batch:?}");
+        let a = stream(&p, "audio");
+        let a_dur: f64 = a["duration"].as_str().unwrap().parse().unwrap();
+        let v_dur = t.duration_us as f64 / 1e6;
+        assert!(
+            (a_dur - v_dur).abs() < 0.05,
+            "batch {batch:?}: audio {a_dur}s vs video {v_dur}s"
+        );
+        durations.push(a_dur);
+    }
+    assert!(
+        durations.windows(2).all(|w| (w[0] - w[1]).abs() < 0.03),
+        "{durations:?}"
+    );
 }

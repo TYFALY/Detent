@@ -10,7 +10,9 @@
 use detent_core::ResolvedTimeline;
 use detent_core::camera::CameraPath;
 use detent_core::edl::{AudioMix, ColorGrade};
-use detent_core::timeline::Layout;
+use std::ops::Range;
+
+use detent_core::timeline::{Layout, Splice};
 
 use crate::encoder::Encoder;
 use crate::expr::Hinges;
@@ -157,8 +159,84 @@ fn segment_post(t: &ResolvedTimeline, i: usize) -> String {
     post
 }
 
+/// Segments per FFmpeg process before the renderer switches to batching.
+///
+/// Every segment opens its own seeked input (two with audio); past this many
+/// the renderer renders batches to lossless intermediates and joins them.
+pub const BATCH_SEGMENTS: usize = 32;
+
 /// Builds the graph. `ass_file` is a path relative to FFmpeg's working dir.
 pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -> CompiledGraph {
+    let mut inputs = Vec::new();
+    let mut stmts = Vec::new();
+    segments(t, 0..t.segments.len(), &mut inputs, &mut stmts);
+    finish(t, encoder, ass_file, &mut stmts);
+    CompiledGraph {
+        inputs,
+        filter: stmts.join(";\n"),
+        has_audio: t.source.has_audio,
+    }
+}
+
+/// Graph for one batch of segments, ending in raw `[vout]` / `[aout]`
+/// (no grade, captions, mix or upload: those run once in [`compile_join`]).
+pub fn compile_batch(t: &ResolvedTimeline, range: Range<usize>) -> CompiledGraph {
+    let mut inputs = Vec::new();
+    let mut stmts = Vec::new();
+    segments(t, range, &mut inputs, &mut stmts);
+    stmts.push("[vcat]null[vout]".to_owned());
+    if t.source.has_audio {
+        stmts.push("[achain]anull[aout]".to_owned());
+    }
+    CompiledGraph {
+        inputs,
+        filter: stmts.join(";\n"),
+        has_audio: t.source.has_audio,
+    }
+}
+
+/// Joins batch files (input `k` is batch `k`, split at `ranges`) and applies
+/// the finishing chain once. The audio crossfade across each batch boundary
+/// is the same splice an unbatched render would use, so lengths are identical.
+pub fn compile_join(
+    t: &ResolvedTimeline,
+    ranges: &[Range<usize>],
+    encoder: Encoder,
+    ass_file: Option<&str>,
+) -> CompiledGraph {
+    let k = ranges.len();
+    let mut stmts = Vec::new();
+    let pads: String = (0..k).map(|i| format!("[{i}:v:0]")).collect();
+    stmts.push(format!("{pads}concat=n={k}:v=1:a=0[vcat]"));
+    if t.source.has_audio {
+        let labels: Vec<String> = (0..k).map(|i| format!("{i}:a:0")).collect();
+        let splices: Vec<&Splice> = ranges[..k.saturating_sub(1)]
+            .iter()
+            .map(|r| &t.splices[r.end - 1])
+            .collect();
+        audio_chain(&labels, &splices, "achain", "jx", &mut stmts);
+    }
+    finish(t, encoder, ass_file, &mut stmts);
+    CompiledGraph {
+        inputs: Vec::new(),
+        filter: stmts.join(";\n"),
+        has_audio: t.source.has_audio,
+    }
+}
+
+/// Splits `n` segments into consecutive batches of at most `size`.
+pub fn batches(n: usize, size: usize) -> Vec<Range<usize>> {
+    let size = size.max(1);
+    (0..n).step_by(size).map(|s| s..(s + size).min(n)).collect()
+}
+
+/// Per-segment picture and sound for `range`, ending in `[vcat]` / `[achain]`.
+fn segments(
+    t: &ResolvedTimeline,
+    range: Range<usize>,
+    inputs: &mut Vec<InputSpec>,
+    stmts: &mut Vec<String>,
+) {
     let src = (t.source.width, t.source.height);
     let raster = (t.output.width, t.output.height);
     // The camera fills the picture area: the whole raster, or the FitBlur foreground.
@@ -166,11 +244,11 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
     let fit_blur = matches!(t.output.layout, Layout::FitBlur { .. });
     let fps = t.source.fps;
     let frame_s = fps.frame_duration_us() as f64 / 1e6;
-    let mut inputs = Vec::new();
-    let mut stmts: Vec<String> = Vec::new();
-    let n = t.segments.len();
+    let mut vlabels = Vec::new();
+    let mut alabels = Vec::new();
 
-    for (i, seg) in t.segments.iter().enumerate() {
+    for i in range.clone() {
+        let seg = &t.segments[i];
         // Seek half a frame early so the first wanted frame is never dropped
         // by µs rounding; `trim=end_frame` then fixes the exact count.
         let v_in = inputs.len();
@@ -206,6 +284,7 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
         } else {
             stmts.push(format!("{head}{cam}{post},setsar=1[v{i}]"));
         }
+        vlabels.push(format!("v{i}"));
         if t.source.has_audio {
             let a_in = inputs.len();
             let len = seg.audio.len_us() as f64 / 1e6;
@@ -216,16 +295,57 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
             stmts.push(format!(
                 "[{a_in}:a:0]aresample=48000,atrim=duration={len:.6},apad=whole_dur={len:.6},asetpts=PTS-STARTPTS[a{i}]"
             ));
+            alabels.push(format!("a{i}"));
         }
     }
 
     // Picture: hard concat (cuts are already frame-exact).
-    if n == 1 {
-        stmts.push("[v0]null[vcat]".to_owned());
+    if vlabels.len() == 1 {
+        stmts.push(format!("[{}]null[vcat]", vlabels[0]));
     } else {
-        let pads: String = (0..n).map(|i| format!("[v{i}]")).collect();
-        stmts.push(format!("{pads}concat=n={n}:v=1:a=0[vcat]"));
+        let pads: String = vlabels.iter().map(|l| format!("[{l}]")).collect();
+        stmts.push(format!("{pads}concat=n={}:v=1:a=0[vcat]", vlabels.len()));
     }
+    if t.source.has_audio {
+        let splices: Vec<&Splice> = t.splices[range.start..range.end - 1].iter().collect();
+        audio_chain(&alabels, &splices, "achain", "ax", stmts);
+    }
+}
+
+/// Chain of equal-power micro-crossfades (or plain joins) ending in `[out]`.
+fn audio_chain(
+    labels: &[String],
+    splices: &[&Splice],
+    out: &str,
+    tmp: &str,
+    stmts: &mut Vec<String>,
+) {
+    if splices.is_empty() {
+        stmts.push(format!("[{}]anull[{out}]", labels[0]));
+        return;
+    }
+    let mut acc = labels[0].clone();
+    for (k, sp) in splices.iter().enumerate() {
+        let next = &labels[k + 1];
+        let label = if k + 1 == splices.len() {
+            out.to_owned()
+        } else {
+            format!("{tmp}{k}")
+        };
+        stmts.push(if sp.crossfade_us > 0 {
+            format!(
+                "[{acc}][{next}]acrossfade=d={:.6}:c1=qsin:c2=qsin[{label}]",
+                sp.crossfade_us as f64 / 1e6
+            )
+        } else {
+            format!("[{acc}][{next}]concat=n=2:v=0:a=1[{label}]")
+        });
+        acc = label;
+    }
+}
+
+/// Grade, captions, upload and the voice mix, from `[vcat]` / `[achain]`.
+fn finish(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>, stmts: &mut Vec<String>) {
     let subs = ass_file
         .map(|p| format!("ass=filename={p},"))
         .unwrap_or_default();
@@ -237,48 +357,18 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
         "[vcat]{grade}{subs}{}[vout]",
         encoder.upload_filter()
     ));
-
-    // Sound: chain of equal-power micro-crossfades.
     if t.source.has_audio {
-        let voice = t.output.audio_mix == AudioMix::VoiceForward;
-        let final_label = if voice { "amix0" } else { "aout" };
-        if t.splices.is_empty() {
-            stmts.push(format!("[a0]anull[{final_label}]"));
-        }
-        let mut acc = "a0".to_owned();
-        for (k, sp) in t.splices.iter().enumerate() {
-            let next = format!("a{}", k + 1);
-            let label = if k + 1 == t.splices.len() {
-                final_label.to_owned()
-            } else {
-                format!("ax{k}")
-            };
-            stmts.push(if sp.crossfade_us > 0 {
-                format!(
-                    "[{acc}][{next}]acrossfade=d={:.6}:c1=qsin:c2=qsin[{label}]",
-                    sp.crossfade_us as f64 / 1e6
-                )
-            } else {
-                format!("[{acc}][{next}]concat=n=2:v=0:a=1[{label}]")
-            });
-            acc = label;
-        }
-        if voice {
+        if t.output.audio_mix == AudioMix::VoiceForward {
             // Rumble cut, 3:1 compression from -20 dBFS, then single-pass
             // loudness normalisation (which works at 192 kHz internally).
             stmts.push(
-                "[amix0]highpass=f=80,acompressor=threshold=0.1:ratio=3:attack=5:release=150:makeup=1.5,\
+                "[achain]highpass=f=80,acompressor=threshold=0.1:ratio=3:attack=5:release=150:makeup=1.5,\
 loudnorm=I=-14:TP=-3:LRA=9,aresample=48000[aout]"
                     .to_owned(),
             );
+        } else {
+            stmts.push("[achain]anull[aout]".to_owned());
         }
-    }
-    let f = stmts.join(";\n");
-
-    CompiledGraph {
-        inputs,
-        filter: f,
-        has_audio: t.source.has_audio,
     }
 }
 
@@ -413,7 +503,7 @@ mod tests {
         assert!(f.contains("[v0][v1]concat=n=2:v=1:a=0[vcat]"));
         assert!(f.contains("ass=filename=captions.ass,format=yuv420p[vout]"));
         assert!(
-            f.contains("[a0][a1]acrossfade=d=0.020000:c1=qsin:c2=qsin[aout]"),
+            f.contains("[a0][a1]acrossfade=d=0.020000:c1=qsin:c2=qsin[achain]"),
             "{f}"
         );
         assert!(!f.trim_end().ends_with(';'));
@@ -478,6 +568,6 @@ mod tests {
         });
         let f = compile(&t, Encoder::Libx264, None).filter;
         assert!(f.contains("[a0][a1]acrossfade=d=0.020000:c1=qsin:c2=qsin[ax0]"));
-        assert!(f.contains("[ax0][a2]concat=n=2:v=0:a=1[aout]"));
+        assert!(f.contains("[ax0][a2]concat=n=2:v=0:a=1[achain]"));
     }
 }

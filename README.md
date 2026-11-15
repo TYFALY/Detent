@@ -56,7 +56,7 @@ flowchart LR
     subgraph IDX["detent-indexer: one bounded-memory pass"]
         A["ffmpeg → 16 kHz mono PCM"] --> DSP["RMS · ZCR · FFT flux<br/>pauses · breaths · peaks"]
         A --> ASR["Transcriber<br/>(whisper.cpp / JSON import)"]
-        V["ffmpeg → 160 px RGB frames"] --> SH["histogram shot detector"]
+        V["ffmpeg → 160 px RGB frames"] --> SH["shot detector (cuts, dissolves, fades)"]
         V --> SAL["subject saliency / ONNX faces"]
         V --> CS["contact sheet grid.jpg"]
     end
@@ -77,7 +77,7 @@ flowchart LR
 |---|---|---|
 | `detent-core` | `MediaIndex`, `SemanticEdl` schema, streaming DSP, spring camera, caption chunker, `EdlSolver`, `ResolvedTimeline` + invariant checker | none (pure) |
 | `detent-indexer` | Decoder traits, FFmpeg streaming decoders, shot detection, saliency, contact sheets, `whisper` / `onnx` adapters | FFmpeg child processes |
-| `detent-renderer` | Encoder discovery, filtergraph compiler, render execution, stream-copy preview | FFmpeg child processes |
+| `detent-renderer` | Encoder discovery, filtergraph compiler, render execution (EDLs over 32 clips render in lossless FFV1 batches, then one join pass applies the cross-batch crossfades, grade and captions), stream-copy preview | FFmpeg child processes |
 | `detent-mcp` | `rmcp` stdio server with four tools | stdio |
 | `detent-cli` | `detent index · solve · render · mcp · schema · encoders · bench` | filesystem |
 
@@ -315,7 +315,7 @@ cargo bench -p detent-core -p detent-indexer
 | `solver/solve/12_clips` | 313 µs | |
 | `solver/solve/32_clips` | 976 µs | |
 | `captions/chunk_1000_words` | 257 µs | |
-| `vision/shot_detector_160x90` (300 frames) | 15.6 ms | 19.2 k frames/s |
+| `vision/shot_detector_160x90` (300 frames, cuts + dissolves) | 17.8 ms | 16.8 k frames/s |
 | `vision/saliency_160x90` (300 frames) | 49.1 ms | 6.1 k frames/s |
 
 Indexing is bound by H.264 decoding in FFmpeg; the analysis itself (DSP, histograms, saliency on 160 px frames) is a small fraction of the wall time. Rendering with zoom is bound by the per-frame bicubic `scale` that implements sub-pixel zoom on the CPU, not by the encoder.
@@ -330,11 +330,11 @@ cargo test --workspace
 |---|---|
 | `detent-core` unit tests | DSP (−3 dBFS sine, chunk-size invariance, silence/breath placement, peak spacing), rational time, EDL strictness and schema, spring closed form, RDP, captions, `.ass` escaping |
 | `detent-core` property tests | spring: no overshoot, target-hull containment, monotone tracking; camera: bounded crops and exact aspect; RDP error bound; captions: order, size and weak-ending rules; **solver**: every invariant above for random indices/EDLs (5 frame rates, any aspect, ± transcript/audio), bounded cut movement, determinism |
-| `detent-indexer` | ffprobe parsing (rotation, cover art, NTSC rates), shot detector, saliency tracking, chunked ASR windowing, contact sheets; **FFmpeg integration**: a synthetic MP4 is cut at exactly frame 75 and its silent gap is found within 50 ms |
-| `detent-renderer` | encoder discovery parsing, filtergraph golden tests, hinge-expression property test; **end-to-end**: index → solve (punch-in, tracking, L-cut, captions) → render has **exactly** the solved frame count, with audio within 50 ms of video; stream-copy preview; tampered timelines rejected |
+| `detent-indexer` | ffprobe parsing (rotation, cover art, NTSC rates), shot detector, saliency tracking, chunked ASR windowing, contact sheets, dissolve and fade-through-black detection (and no false hits on drift or slow pans); **FFmpeg integration**: a synthetic MP4 is cut at exactly frame 75 and its silent gap is found within 50 ms; a real `xfade` dissolve and `fadeblack` are each found once |
+| `detent-renderer` | encoder discovery parsing, filtergraph golden tests, hinge-expression property test; **end-to-end**: index → solve (punch-in, tracking, L-cut, captions) → render has **exactly** the solved frame count, with audio within 50 ms of video; stream-copy preview; tampered timelines rejected; **batched rendering** (1 and 3 segments per process) gives the same frame count and A/V length as a single pass |
 | `detent-mcp` | spawns the real binary and speaks JSON-RPC over stdio: initialize, tools/list, a hallucinated field rejected, index → validation issues → solve → render → inspect |
 
-Tests that need FFmpeg skip with a message when it is not installed. CI runs `fmt`, `clippy -D warnings`, tests on Linux (with FFmpeg), macOS and Windows, a one-shot run of every benchmark, and a Linux job that compiles the `whisper` and `onnx` adapters.
+Tests that need FFmpeg skip with a message when it is not installed. CI runs `fmt`, `clippy -D warnings`, tests on Linux (with FFmpeg), macOS and Windows, a one-shot run of every benchmark, a Linux job that compiles the `whisper` and `onnx` adapters, and a Windows MSVC job that compiles `whisper`.
 
 ## Feature flags (`detent-indexer`)
 
@@ -348,9 +348,7 @@ Tests that need FFmpeg skip with a message when it is not installed. CI runs `fm
 ## Limitations
 
 - The default subject tracker is a heuristic (motion energy, YCbCr skin prior and centre bias). It works for single-subject footage. Use `onnx` for real face detection; against ONNX Runtime 1.24.4 it found 42 faces in a ~50-person group photo, and the gated `onnx_faces` test checks box sanity and subject stability on real photos.
-- The shot detector finds hard cuts, not dissolves or fades.
-- The native `whisper` feature does not build with the `x86_64-pc-windows-gnu` toolchain (whisper-rs passes the MSVC-only `/utf-8` flag to MinGW). The default `whisper-cli` path works there.
-- The renderer opens one FFmpeg input per segment (two with audio). That keeps memory bounded, but very long EDLs (hundreds of clips) are better rendered in batches.
+- On Windows, the native `whisper` feature needs the MSVC toolchain (CI builds it on `windows-latest`). Under `x86_64-pc-windows-gnu`, whisper-rs 0.16 has three separate upstream bugs: an MSVC-only `/utf-8` flag, `ggml.a` library naming and enum signedness. The default `whisper-cli` path works on every toolchain.
 
 - J/L cuts need speech-free audio on both sides of a splice. In continuous speech the solver honestly downgrades them to hard cuts with a micro-crossfade rather than leaking a neighbouring word.
 
