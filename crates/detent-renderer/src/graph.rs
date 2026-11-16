@@ -9,7 +9,8 @@
 
 use detent_core::ResolvedTimeline;
 use detent_core::camera::CameraPath;
-use detent_core::edl::{AudioMix, ColorGrade};
+use detent_core::edl::{AudioMix, ColorGrade, InsertPlacement, is_video_insert};
+use detent_core::timeline::SfxKind;
 use std::ops::Range;
 
 use detent_core::timeline::{Layout, Splice};
@@ -35,6 +36,9 @@ pub struct CompiledGraph {
     pub filter: String,
     /// Whether `[aout]` exists.
     pub has_audio: bool,
+    /// Insert and music files, added after `inputs` (or after the batch
+    /// files of a join), in this order.
+    pub extra: Vec<ExtraInput>,
 }
 
 /// How a segment's virtual camera maps to filters.
@@ -170,11 +174,12 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
     let mut inputs = Vec::new();
     let mut stmts = Vec::new();
     segments(t, 0..t.segments.len(), &mut inputs, &mut stmts);
-    finish(t, encoder, ass_file, &mut stmts);
+    let extra = finish(t, encoder, ass_file, inputs.len(), &mut stmts);
     CompiledGraph {
         inputs,
         filter: stmts.join(";\n"),
         has_audio: t.source.has_audio,
+        extra,
     }
 }
 
@@ -192,6 +197,7 @@ pub fn compile_batch(t: &ResolvedTimeline, range: Range<usize>) -> CompiledGraph
         inputs,
         filter: stmts.join(";\n"),
         has_audio: t.source.has_audio,
+        extra: Vec::new(),
     }
 }
 
@@ -216,11 +222,12 @@ pub fn compile_join(
             .collect();
         audio_chain(&labels, &splices, "achain", "jx", &mut stmts);
     }
-    finish(t, encoder, ass_file, &mut stmts);
+    let extra = finish(t, encoder, ass_file, k, &mut stmts);
     CompiledGraph {
         inputs: Vec::new(),
         filter: stmts.join(";\n"),
         has_audio: t.source.has_audio,
+        extra,
     }
 }
 
@@ -344,8 +351,222 @@ fn audio_chain(
     }
 }
 
-/// Grade, captions, upload and the voice mix, from `[vcat]` / `[achain]`.
-fn finish(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>, stmts: &mut Vec<String>) {
+/// An input beyond the source segments: an insert or the music bed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtraInput {
+    /// A still image looped for `len_s` at the output frame rate.
+    Still {
+        /// File path as written in the EDL.
+        path: String,
+        /// Read length (s).
+        len_s: f64,
+    },
+    /// A video (or music) file looped for `len_s`.
+    Looped {
+        /// File path as written in the EDL.
+        path: String,
+        /// Read length (s).
+        len_s: f64,
+    },
+}
+
+impl ExtraInput {
+    /// File path.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Still { path, .. } | Self::Looped { path, .. } => path,
+        }
+    }
+}
+
+/// Border colour of cards.
+const CARD_BORDER: &str = "0xFFE600";
+/// Seconds a card takes to pop to full size.
+pub const CARD_POP_S: f64 = 0.16;
+/// Fade-out length of a card (s).
+pub const CARD_OUT_S: f64 = 0.10;
+/// Card scale at the first frame of the pop.
+const CARD_POP_FROM: f64 = 0.5;
+
+/// Filters for insert `j` (input `input`), overlaid on `[base]`, ending in
+/// `[out]`. The input's timestamps start at 0, so they are shifted to the
+/// insert's start first and every time below is on the output clock.
+fn insert(t: &ResolvedTimeline, j: usize, input: usize, base: &str, out: &str) -> Vec<String> {
+    let ins = &t.inserts[j];
+    let (w, h) = (t.output.width, t.output.height);
+    let (s, e) = (ins.start_us as f64 / 1e6, ins.end_us as f64 / 1e6);
+    let fps = t.output.fps;
+    let head = format!(
+        "[{input}:v:0]fps={}/{},setpts=PTS-STARTPTS+{s:.6}/TB",
+        fps.num, fps.den
+    );
+    let enable = format!("enable='between(t,{s:.3},{e:.3})'");
+    if !ins.placement.is_card() {
+        // B-roll cutaway: cover the raster, hard cut in and out.
+        return vec![
+            format!(
+                "{head},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1[ins{j}]"
+            ),
+            format!("[{base}][ins{j}]overlay=x=0:y=0:{enable}:eof_action=pass[{out}]"),
+        ];
+    }
+    let (wf, hf) = (f64::from(w), f64::from(h));
+    let b = (((hf * 0.006).round() as u32) / 2 * 2).max(2);
+    let max_w = (wf * 0.80) as u32 / 2 * 2;
+    let max_h = (hf * 0.32) as u32 / 2 * 2;
+    let cy = hf
+        * match ins.placement {
+            InsertPlacement::Upper => 0.33,
+            InsertPlacement::Lower => 0.60,
+            _ => 0.48,
+        };
+    // Ease-out-back from 50% to 100% (peaking near 105%) over CARD_POP_S:
+    // the card "pops" like the stickers in commentary Shorts.
+    let p = format!("clip((t-{s:.6})/{CARD_POP_S},0,1)");
+    let k = format!(
+        "({CARD_POP_FROM}+{r}*(1+2.70158*pow({p}-1,3)+1.70158*pow({p}-1,2)))",
+        r = 1.0 - CARD_POP_FROM
+    );
+    // Canvas with room for the overshoot, so the overlay size never changes.
+    let canvas = |m: u32| ((f64::from(m + 2 * b) * 1.06).ceil() as u32).div_ceil(2) * 2;
+    let out_st = (e - CARD_OUT_S).max(s);
+    vec![
+        format!(
+            "{head},scale=w={max_w}:h={max_h}:force_original_aspect_ratio=decrease,\
+scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2,pad=w=iw+{b2}:h=ih+{b2}:x={b}:y={b}:color={CARD_BORDER},\
+format=rgba,scale=w='2*trunc(iw*{k}/2)':h='2*trunc(ih*{k}/2)':eval=frame,\
+pad=w={cw}:h={ch}:x=(ow-iw)/2:y=(oh-ih)/2:color=black@0:eval=frame,\
+fade=t=out:st={out_st:.3}:d={CARD_OUT_S}:alpha=1[ins{j}]",
+            b2 = 2 * b,
+            cw = canvas(max_w),
+            ch = canvas(max_h),
+        ),
+        format!("[{base}][ins{j}]overlay=x=(W-w)/2:y={cy:.0}-h/2:{enable}:eof_action=pass[{out}]"),
+    ]
+}
+
+/// Synthesised effect sources (mono, 48 kHz), each `asplit` to its uses.
+fn sfx_source(kind: SfxKind) -> &'static str {
+    match kind {
+        // Pink noise through a wide band-pass, swelling for 250 ms into the
+        // cut and dying away just after it.
+        SfxKind::Whoosh => {
+            "anoisesrc=d=0.42:c=pink:r=48000:a=0.9,bandpass=f=1600:width_type=o:w=2.5,\
+afade=t=in:d=0.25:curve=exp,afade=t=out:st=0.25:d=0.17:curve=exp"
+        }
+        // A 2.4 kHz tick with a burst of noise, gone in 60 ms.
+        SfxKind::Click => {
+            "aevalsrc='0.9*sin(2*PI*2400*t)*exp(-t*90)+0.6*(random(0)-0.5)*exp(-t*160)':d=0.06:s=48000"
+        }
+        // A sine whose pitch falls from 1280 Hz to 380 Hz in ~100 ms.
+        SfxKind::Pop => {
+            "aevalsrc='0.8*sin(2*PI*(380*t+30*(1-exp(-30*t))))*exp(-t*22)':d=0.16:s=48000"
+        }
+    }
+}
+
+const MIX_FORMAT: &str = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
+
+/// Voice processing, effects, ducked music and the final level, from
+/// `[achain]` to `[aout]`. The music input (if any) is `music_input`.
+fn audio_finish(t: &ResolvedTimeline, music_input: Option<usize>, stmts: &mut Vec<String>) {
+    let forward = t.output.audio_mix == AudioMix::VoiceForward;
+    let Some(sound) = t.sound.as_ref() else {
+        stmts.push(if forward {
+            // Rumble cut, 3:1 compression from -20 dBFS, then single-pass
+            // loudness normalisation (which works at 192 kHz internally).
+            "[achain]highpass=f=80,acompressor=threshold=0.1:ratio=3:attack=5:release=150:makeup=1.5,\
+loudnorm=I=-14:TP=-3:LRA=9,aresample=48000[aout]"
+                .to_owned()
+        } else {
+            "[achain]anull[aout]".to_owned()
+        });
+        return;
+    };
+    let voice = if forward {
+        "highpass=f=80,acompressor=threshold=0.1:ratio=3:attack=5:release=150:makeup=1.5,"
+    } else {
+        ""
+    };
+    let music = music_input.zip(sound.music.as_ref());
+    let duck = music.is_some_and(|(_, m)| m.duck);
+    stmts.push(format!(
+        "[achain]{voice}{MIX_FORMAT}{}",
+        if duck {
+            ",asplit=2[vox][voxsc]"
+        } else {
+            "[vox]"
+        }
+    ));
+    let mut mix = vec!["vox".to_owned()];
+    if let Some((input, m)) = music {
+        let dur = t.duration_us as f64 / 1e6;
+        let fade_out = (dur - 0.8).max(0.0);
+        let tail = if duck { "[mus0]" } else { "[mus]" };
+        stmts.push(format!(
+            "[{input}:a:0]loudnorm=I=-14:TP=-2:LRA=11,{MIX_FORMAT},volume={:.1}dB,afade=t=in:d=0.5,afade=t=out:st={fade_out:.3}:d=0.8{tail}",
+            m.volume_db
+        ));
+        if duck {
+            // Dip ~8-10 dB under speech, recover over ~0.4 s in the gaps.
+            stmts.push(
+                "[mus0][voxsc]sidechaincompress=threshold=0.03:ratio=6:attack=15:release=400[mus]"
+                    .to_owned(),
+            );
+        }
+        mix.push("mus".to_owned());
+    }
+    for kind in [SfxKind::Whoosh, SfxKind::Click, SfxKind::Pop] {
+        let uses: Vec<i64> = sound
+            .sfx
+            .iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| (e.at_us - kind.lead_us()).max(0))
+            .collect();
+        if uses.is_empty() {
+            continue;
+        }
+        let tag = format!("{kind:?}").to_lowercase();
+        let pads: String = (0..uses.len()).map(|n| format!("[{tag}{n}]")).collect();
+        stmts.push(format!(
+            "{},{MIX_FORMAT},volume={:.1}dB,asplit={}{pads}",
+            sfx_source(kind),
+            sound.sfx_db,
+            uses.len()
+        ));
+        for (n, at) in uses.iter().enumerate() {
+            let ms = (*at as f64 / 1e3).round() as i64;
+            stmts.push(format!("[{tag}{n}]adelay=delays={ms}:all=1[{tag}d{n}]"));
+            mix.push(format!("{tag}d{n}"));
+        }
+    }
+    let pads: String = mix.iter().map(|l| format!("[{l}]")).collect();
+    let level = if forward {
+        "loudnorm=I=-14:TP=-3:LRA=9,aresample=48000"
+    } else {
+        // Keep the source level, but never let the extra layers clip.
+        "alimiter=limit=0.95:level=0"
+    };
+    stmts.push(if mix.len() == 1 {
+        format!("[vox]{level}[aout]")
+    } else {
+        format!(
+            "{pads}amix=inputs={}:normalize=0:duration=first:dropout_transition=0,{level}[aout]",
+            mix.len()
+        )
+    });
+}
+
+/// Grade, inserts, captions, upload and the audio finish, from `[vcat]` /
+/// `[achain]`. Extra inputs (inserts, then music) are numbered from
+/// `extra_base`; returns them in input order.
+fn finish(
+    t: &ResolvedTimeline,
+    encoder: Encoder,
+    ass_file: Option<&str>,
+    extra_base: usize,
+    stmts: &mut Vec<String>,
+) -> Vec<ExtraInput> {
     let subs = ass_file
         .map(|p| format!("ass=filename={p},"))
         .unwrap_or_default();
@@ -353,23 +574,41 @@ fn finish(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>, stmts:
         ColorGrade::None => "",
         ColorGrade::MobilePop => "eq=contrast=1.08:saturation=1.05,unsharp=5:5:0.6:5:5:0.0,",
     };
+    let mut extra = Vec::new();
+    let mut base = "vcat".to_owned();
+    let mut pre = grade;
+    if !t.inserts.is_empty() {
+        stmts.push(format!("[vcat]{grade}null[vg]"));
+        base = "vg".to_owned();
+        pre = "";
+        for (j, ins) in t.inserts.iter().enumerate() {
+            let out = format!("vi{j}");
+            stmts.extend(insert(t, j, extra_base + extra.len(), &base, &out));
+            base = out;
+            let len_s = (ins.end_us - ins.start_us) as f64 / 1e6 + 0.1;
+            let path = ins.path.clone();
+            extra.push(if is_video_insert(&path) {
+                ExtraInput::Looped { path, len_s }
+            } else {
+                ExtraInput::Still { path, len_s }
+            });
+        }
+    }
     stmts.push(format!(
-        "[vcat]{grade}{subs}{}[vout]",
+        "[{base}]{pre}{subs}{}[vout]",
         encoder.upload_filter()
     ));
     if t.source.has_audio {
-        if t.output.audio_mix == AudioMix::VoiceForward {
-            // Rumble cut, 3:1 compression from -20 dBFS, then single-pass
-            // loudness normalisation (which works at 192 kHz internally).
-            stmts.push(
-                "[achain]highpass=f=80,acompressor=threshold=0.1:ratio=3:attack=5:release=150:makeup=1.5,\
-loudnorm=I=-14:TP=-3:LRA=9,aresample=48000[aout]"
-                    .to_owned(),
-            );
-        } else {
-            stmts.push("[achain]anull[aout]".to_owned());
-        }
+        let music = t.sound.as_ref().and_then(|s| s.music.as_ref()).map(|m| {
+            extra.push(ExtraInput::Looped {
+                path: m.path.clone(),
+                len_s: t.duration_us as f64 / 1e6 + 0.1,
+            });
+            extra_base + extra.len() - 1
+        });
+        audio_finish(t, music, stmts);
     }
+    extra
 }
 
 #[cfg(test)]
@@ -451,6 +690,8 @@ mod tests {
                 flash: false,
             }],
             captions: None,
+            inserts: Vec::new(),
+            sound: None,
             duration_us: 4_000_000,
         }
     }
@@ -507,6 +748,167 @@ mod tests {
             "{f}"
         );
         assert!(!f.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn inserts_overlay_before_captions() {
+        use detent_core::timeline::ResolvedInsert;
+        let mut t = timeline();
+        t.output.grade = ColorGrade::MobilePop;
+        t.inserts = vec![
+            ResolvedInsert {
+                path: "shot.png".into(),
+                start_us: 500_000,
+                end_us: 2_000_000,
+                placement: InsertPlacement::Upper,
+            },
+            ResolvedInsert {
+                path: "news.jpg".into(),
+                start_us: 2_500_000,
+                end_us: 3_500_000,
+                placement: InsertPlacement::Lower,
+            },
+        ];
+        t.inserts.push(ResolvedInsert {
+            path: "broll.mp4".into(),
+            start_us: 3_600_000,
+            end_us: 4_000_000,
+            placement: InsertPlacement::Fullscreen,
+        });
+        let g = compile(&t, Encoder::Libx264, Some("captions.ass"));
+        let paths: Vec<&str> = g.extra.iter().map(ExtraInput::path).collect();
+        assert_eq!(paths, ["shot.png", "news.jpg", "broll.mp4"]);
+        assert!(
+            matches!(g.extra[0], ExtraInput::Still { len_s, .. } if (len_s - 1.6).abs() < 1e-9)
+        );
+        assert!(matches!(g.extra[2], ExtraInput::Looped { .. }));
+        let f = &g.filter;
+        // Inserts follow the 4 segment inputs, shifted onto the output clock.
+        assert!(
+            f.contains("[4:v:0]fps=30/1,setpts=PTS-STARTPTS+0.500000/TB,scale=w=864:h=614:force_original_aspect_ratio=decrease"),
+            "{f}"
+        );
+        assert!(
+            f.contains("[5:v:0]fps=30/1,setpts=PTS-STARTPTS+2.500000/TB,"),
+            "{f}"
+        );
+        assert!(
+            f.contains("pad=w=iw+24:h=ih+24:x=12:y=12:color=0xFFE600"),
+            "{f}"
+        );
+        // Cards pop from 50% with an overshoot on a fixed transparent canvas.
+        assert!(
+            f.contains(
+                "scale=w='2*trunc(iw*(0.5+0.5*(1+2.70158*pow(clip((t-0.500000)/0.16,0,1)-1,3)"
+            ),
+            "{f}"
+        );
+        assert!(
+            f.contains("pad=w=942:h=678:x=(ow-iw)/2:y=(oh-ih)/2:color=black@0:eval=frame"),
+            "{f}"
+        );
+        assert!(f.contains("fade=t=out:st=1.900:d=0.1:alpha=1[ins0]"), "{f}");
+        // Grade first, inserts in order, then captions on top.
+        assert!(f.contains("[vcat]eq=contrast=1.08"), "{f}");
+        assert!(
+            f.contains("[vg][ins0]overlay=x=(W-w)/2:y=634-h/2:enable='between(t,0.500,2.000)'"),
+            "{f}"
+        );
+        assert!(
+            f.contains("[vi0][ins1]overlay=x=(W-w)/2:y=1152-h/2:"),
+            "{f}"
+        );
+        // The cutaway covers the frame.
+        assert!(
+            f.contains("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"),
+            "{f}"
+        );
+        assert!(
+            f.contains("[vi1][ins2]overlay=x=0:y=0:enable='between(t,3.600,4.000)'"),
+            "{f}"
+        );
+        assert!(
+            f.contains("[vi2]ass=filename=captions.ass,format=yuv420p[vout]"),
+            "{f}"
+        );
+        // A join numbers the inserts after its batch files.
+        let j = compile_join(&t, &[0..1, 1..2], Encoder::Libx264, None);
+        assert!(j.filter.contains("[2:v:0]fps="), "{}", j.filter);
+        assert!(
+            j.filter.contains("[vi2]format=yuv420p[vout]"),
+            "{}",
+            j.filter
+        );
+    }
+
+    #[test]
+    fn sound_design_mixes_effects_and_ducked_music() {
+        use detent_core::edl::MusicSpec;
+        use detent_core::timeline::{ResolvedSound, SfxEvent};
+        let mut t = timeline();
+        t.output.audio_mix = AudioMix::VoiceForward;
+        t.sound = Some(ResolvedSound {
+            sfx: vec![
+                SfxEvent {
+                    kind: SfxKind::Pop,
+                    at_us: 100_000,
+                },
+                SfxEvent {
+                    kind: SfxKind::Whoosh,
+                    at_us: 2_000_000,
+                },
+                SfxEvent {
+                    kind: SfxKind::Whoosh,
+                    at_us: 3_000_000,
+                },
+            ],
+            sfx_db: -12.0,
+            music: Some(MusicSpec {
+                path: "bed.mp3".into(),
+                volume_db: -20.0,
+                duck: true,
+            }),
+        });
+        let g = compile(&t, Encoder::Libx264, None);
+        assert!(matches!(&g.extra[..], [ExtraInput::Looped { path, .. }] if path == "bed.mp3"));
+        let f = &g.filter;
+        // Voice: processed, then split for the sidechain.
+        assert!(f.contains("[achain]highpass=f=80,acompressor="), "{f}");
+        assert!(f.contains(",asplit=2[vox][voxsc]"), "{f}");
+        // Music (input 4) under the voice, ducked.
+        assert!(
+            f.contains("[4:a:0]loudnorm=I=-14:TP=-2:LRA=11,aformat="),
+            "{f}"
+        );
+        assert!(
+            f.contains("volume=-20.0dB,afade=t=in:d=0.5,afade=t=out:st=3.200:d=0.8[mus0]"),
+            "{f}"
+        );
+        assert!(f.contains("[mus0][voxsc]sidechaincompress="), "{f}");
+        // One whoosh source split twice, swelling 250 ms into each cut.
+        assert!(f.contains("anoisesrc=d=0.42"), "{f}");
+        assert!(
+            f.contains("volume=-12.0dB,asplit=2[whoosh0][whoosh1]"),
+            "{f}"
+        );
+        assert!(
+            f.contains("[whoosh0]adelay=delays=1750:all=1[whooshd0]"),
+            "{f}"
+        );
+        assert!(
+            f.contains("[whoosh1]adelay=delays=2750:all=1[whooshd1]"),
+            "{f}"
+        );
+        assert!(f.contains("[pop0]adelay=delays=100:all=1[popd0]"), "{f}");
+        assert!(
+            f.contains("[vox][mus][whooshd0][whooshd1][popd0]amix=inputs=5:normalize=0:duration=first:dropout_transition=0,loudnorm=I=-14"),
+            "{f}"
+        );
+        // Without sound design the mix is unchanged.
+        t.sound = None;
+        let g = compile(&t, Encoder::Libx264, None);
+        assert!(g.extra.is_empty());
+        assert!(!g.filter.contains("amix"));
     }
 
     #[test]

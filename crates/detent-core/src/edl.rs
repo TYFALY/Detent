@@ -45,6 +45,25 @@ pub struct SemanticEdl {
     /// `WordBounce` renders them green and slightly larger.
     #[serde(default)]
     pub highlight_words: Vec<String>,
+    /// Per-word accent colours, the "colour-code the keywords" look (names
+    /// red, places yellow, the punchline in blue...). Case-insensitive,
+    /// punctuation ignored; overrides `highlight_words` for the same word.
+    /// Used by `WordPunch`, `WordBounce` and `BoldPop`.
+    #[serde(default)]
+    pub word_colors: Vec<WordColor>,
+    /// Persistent step/section labels ("1. Choose Distro", "2. Get the ISO")
+    /// shown under the captions from the start of `clip` until the next
+    /// chapter begins. Requires `captions`.
+    #[serde(default)]
+    pub chapters: Vec<Chapter>,
+    /// B-roll over the A-roll: image/video cards (screenshots, headlines,
+    /// product shots) that pop in with a coloured border, or full-frame
+    /// cutaways while the voice keeps playing.
+    #[serde(default)]
+    pub inserts: Vec<Insert>,
+    /// Sound design: whooshes on cuts, pops on cards, a ducked music bed.
+    #[serde(default)]
+    pub sound: Option<SoundSpec>,
     /// How long the headline stays on screen (ms from the start). Omit to pin
     /// it for the whole video; 3000 gives a classic 3-second hook banner.
     #[serde(default)]
@@ -226,6 +245,195 @@ pub enum CaptionStyle {
     /// One word at a time in heavy yellow with a thick black stroke; each word
     /// lands with a small overshoot bounce.
     WordBounce,
+    /// One word at a time in big white type with a heavy black stroke that
+    /// slams in from 130%: the fast commentary-Short look. Pair it with
+    /// `word_colors` to colour-code the keywords.
+    WordPunch,
+}
+
+/// Accent colour for an emphasised caption word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum AccentColor {
+    /// Danger, names, villains.
+    Red,
+    /// The default emphasis colour.
+    Yellow,
+    /// Money, wins, "yes".
+    Green,
+    /// Calm contrast, second names.
+    Blue,
+    /// Warm alternative to red.
+    Orange,
+    /// Playful accents.
+    Pink,
+}
+
+impl AccentColor {
+    /// ASS colour (`&HBBGGRR&`).
+    pub fn ass(self) -> &'static str {
+        match self {
+            Self::Red => "&H3030FF&",
+            Self::Yellow => "&H00E6FF&",
+            Self::Green => "&H5CFF39&",
+            Self::Blue => "&HFF9E2E&",
+            Self::Orange => "&H1A8CFF&",
+            Self::Pink => "&HC86BFF&",
+        }
+    }
+}
+
+/// One coloured caption word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WordColor {
+    /// The word as spoken (case-insensitive, punctuation ignored).
+    #[schemars(length(min = 1, max = 40))]
+    pub word: String,
+    /// Its colour.
+    pub color: AccentColor,
+}
+
+/// A persistent section label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Chapter {
+    /// Index into `clips` where this chapter starts.
+    pub clip: usize,
+    /// Label text, e.g. "3. Make a Bootable USB".
+    #[schemars(length(min = 1, max = 40))]
+    pub text: String,
+}
+
+/// Where an insert sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum InsertPlacement {
+    /// Card in the upper half, clear of the headline (the usual spot, above
+    /// the face).
+    #[default]
+    Upper,
+    /// Card in the centre of the frame (covers the speaker: short reveals).
+    Center,
+    /// Card in the lower half, above the captions.
+    Lower,
+    /// B-roll cutaway: the insert covers the whole frame (hard cut in and
+    /// out, no border) while the A-roll audio keeps playing. Captions,
+    /// chapters and the headline stay on top.
+    Fullscreen,
+}
+
+impl InsertPlacement {
+    /// True for a bordered card (not a full-frame cutaway).
+    pub fn is_card(self) -> bool {
+        self != Self::Fullscreen
+    }
+}
+
+/// An image or video over the picture: a bordered card that pops in, or a
+/// full-frame B-roll cutaway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Insert {
+    /// Image (PNG, JPEG, WebP) or video (MP4, MOV, WebM, MKV) file, absolute
+    /// or relative to the working directory. Videos play from their start,
+    /// muted, looping if shorter than `duration_ms`.
+    #[schemars(length(min = 1))]
+    pub path: String,
+    /// Index into `clips`; the card appears during this clip.
+    pub clip: usize,
+    /// Delay from the clip's start in the output (ms).
+    #[serde(default)]
+    pub offset_ms: u32,
+    /// Time on screen (ms).
+    #[schemars(range(min = 400, max = 15000))]
+    pub duration_ms: u32,
+    /// Placement preset.
+    #[serde(default)]
+    pub placement: InsertPlacement,
+}
+
+/// Image extensions accepted for inserts.
+pub const INSERT_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+/// Video extensions accepted for inserts.
+pub const INSERT_VIDEO_EXTENSIONS: [&str; 4] = ["mp4", "mov", "webm", "mkv"];
+
+/// True when `path` names a video insert (by extension).
+pub fn is_video_insert(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| INSERT_VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Sound effect played on picture cuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum CutSfx {
+    /// No effect.
+    #[default]
+    None,
+    /// A short airy swoosh that peaks on the cut (synthesised, royalty free).
+    Whoosh,
+    /// A tight percussive click (synthesised).
+    Click,
+}
+
+/// Sound effect played when a card pops in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum PopSfx {
+    /// No effect.
+    #[default]
+    None,
+    /// A bubbly "pop" with a fast downward pitch sweep (synthesised).
+    Pop,
+}
+
+/// Background music under the voice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MusicSpec {
+    /// Audio file you have the rights to use (loops if shorter than the edit).
+    #[schemars(length(min = 1))]
+    pub path: String,
+    /// Bed level (dB) after the track is normalised to -14 LUFS, before
+    /// ducking. -20 puts it about 20 dB under a -14 LUFS voice, like most
+    /// commentary Shorts.
+    #[serde(default = "default_music_db")]
+    #[schemars(range(min = -40.0, max = -6.0))]
+    pub volume_db: f32,
+    /// Dip the music while someone talks (sidechain compression).
+    #[serde(default = "default_true")]
+    pub duck: bool,
+}
+
+fn default_music_db() -> f32 {
+    -20.0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Sound design layered over the A-roll audio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SoundSpec {
+    /// Effect on every cut between two different clips (not on the jump cuts
+    /// `tighten` makes inside a clip) and on every B-roll cutaway.
+    #[serde(default)]
+    pub cut_sfx: CutSfx,
+    /// Effect when a card pops in.
+    #[serde(default)]
+    pub pop_sfx: PopSfx,
+    /// Effect level relative to the voice (dB).
+    #[serde(default = "default_sfx_db")]
+    #[schemars(range(min = -30.0, max = 0.0))]
+    pub sfx_db: f32,
+    /// Background music bed.
+    #[serde(default)]
+    pub music: Option<MusicSpec>,
+}
+
+fn default_sfx_db() -> f32 {
+    -12.0
 }
 
 /// Vertical caption placement.
@@ -490,11 +698,31 @@ impl SemanticEdl {
                 })
             })
             .collect();
+        // Chapters and inserts start with the first piece of their clip.
+        let first_piece = |orig: usize| origin.iter().position(|&o| o == orig).unwrap_or(orig);
+        let chapters = self
+            .chapters
+            .iter()
+            .map(|c| Chapter {
+                clip: first_piece(c.clip),
+                ..c.clone()
+            })
+            .collect();
+        let inserts = self
+            .inserts
+            .iter()
+            .map(|c| Insert {
+                clip: first_piece(c.clip),
+                ..c.clone()
+            })
+            .collect();
         let edl = Self {
             clips,
             motion_cues,
             audio_transitions,
             video_transitions,
+            chapters,
+            inserts,
             tighten: None,
             ..self.clone()
         };
@@ -641,6 +869,102 @@ impl SemanticEdl {
                 issues.push(ValidationIssue::new(
                     "/headline_duration_ms",
                     "headline_duration_ms needs a headline",
+                ));
+            }
+        }
+        for (i, w) in self.word_colors.iter().enumerate() {
+            let len = w.word.trim().chars().count();
+            if len == 0 || len > 40 {
+                issues.push(ValidationIssue::new(
+                    format!("/word_colors/{i}/word"),
+                    "word must be 1-40 characters",
+                ));
+            }
+        }
+        let mut last = None;
+        for (i, c) in self.chapters.iter().enumerate() {
+            let p = format!("/chapters/{i}");
+            if c.clip >= n {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/clip"),
+                    format!("clip index {} out of range (0..{n})", c.clip),
+                ));
+            }
+            if last.is_some_and(|l| c.clip <= l) {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/clip"),
+                    "chapters must be in increasing clip order, one per clip",
+                ));
+            }
+            last = Some(c.clip);
+            let len = c.text.trim().chars().count();
+            if len == 0 || len > 40 {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/text"),
+                    "text must be 1-40 characters",
+                ));
+            }
+            if self.captions.is_none() {
+                issues.push(ValidationIssue::new(p, "chapters need captions"));
+            }
+        }
+        for (i, c) in self.inserts.iter().enumerate() {
+            let p = format!("/inserts/{i}");
+            if c.clip >= n {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/clip"),
+                    format!("clip index {} out of range (0..{n})", c.clip),
+                ));
+            }
+            if !(400..=15000).contains(&c.duration_ms) {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/duration_ms"),
+                    "duration_ms must be within 400..=15000",
+                ));
+            }
+            let ext = std::path::Path::new(&c.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase);
+            if !ext.is_some_and(|e| {
+                INSERT_EXTENSIONS.contains(&e.as_str())
+                    || INSERT_VIDEO_EXTENSIONS.contains(&e.as_str())
+            }) {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/path"),
+                    format!(
+                        "inserts must be images ({}) or videos ({})",
+                        INSERT_EXTENSIONS.join(", "),
+                        INSERT_VIDEO_EXTENSIONS.join(", ")
+                    ),
+                ));
+            }
+        }
+        if let Some(s) = &self.sound {
+            if !(-30.0..=0.0).contains(&s.sfx_db) {
+                issues.push(ValidationIssue::new(
+                    "/sound/sfx_db",
+                    "sfx_db must be within -30..=0",
+                ));
+            }
+            if let Some(m) = &s.music {
+                if !(-40.0..=-6.0).contains(&m.volume_db) {
+                    issues.push(ValidationIssue::new(
+                        "/sound/music/volume_db",
+                        "volume_db must be within -40..=-6",
+                    ));
+                }
+                if m.path.trim().is_empty() {
+                    issues.push(ValidationIssue::new(
+                        "/sound/music/path",
+                        "music path is empty",
+                    ));
+                }
+            }
+            if index.source.audio.is_none() {
+                issues.push(ValidationIssue::new(
+                    "/sound",
+                    "sound design needs a source with an audio stream",
                 ));
             }
         }

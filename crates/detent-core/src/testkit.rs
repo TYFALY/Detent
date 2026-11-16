@@ -232,6 +232,10 @@ pub fn synthetic_edl(index: &MediaIndex, clips: usize, seed: u32) -> SemanticEdl
         captions: Some(CaptionSpec::default()),
         headline: None,
         highlight_words: Vec::new(),
+        word_colors: Vec::new(),
+        chapters: Vec::new(),
+        inserts: Vec::new(),
+        sound: None,
         headline_duration_ms: None,
         video_transitions: (0..clips.saturating_sub(1))
             .step_by(2)

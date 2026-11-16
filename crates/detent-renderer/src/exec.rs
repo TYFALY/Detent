@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::encoder::{Encoder, EncoderChoice, FfmpegInfo, Quality, Tools};
 use crate::error::{RenderError, Result, io_err};
-use crate::graph::{BATCH_SEGMENTS, InputSpec, batches, compile, compile_batch, compile_join};
+use crate::graph::{
+    BATCH_SEGMENTS, ExtraInput, InputSpec, batches, compile, compile_batch, compile_join,
+};
 
 /// Render mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
@@ -149,6 +151,8 @@ impl Renderer {
                         highlight_words: &c.highlight_words,
                         duration_us: t.duration_us,
                         headline_end_us: c.headline_end_us,
+                        word_colors: &c.word_colors,
+                        chapters: &c.chapters,
                     },
                 );
                 let p = work.path().join("captions.ass");
@@ -157,6 +161,24 @@ impl Renderer {
             }
             _ => None,
         };
+        // Inserts and music are read from the caller's working directory,
+        // but FFmpeg runs in the temp dir: resolve them up front (and fail
+        // early when one is missing).
+        let mut extra_files: Vec<&str> = t.inserts.iter().map(|i| i.path.as_str()).collect();
+        extra_files.extend(
+            t.sound
+                .as_ref()
+                .and_then(|s| s.music.as_ref())
+                .map(|m| m.path.as_str()),
+        );
+        let resolved = extra_files
+            .into_iter()
+            .map(|f| {
+                let p = absolute(Path::new(f))?;
+                std::fs::metadata(&p).map_err(io_err(&p))?;
+                Ok((f.to_owned(), p))
+            })
+            .collect::<Result<Vec<(String, PathBuf)>>>()?;
         let n = t.segments.len();
         let batch = opts.batch_segments.unwrap_or(BATCH_SEGMENTS).max(1);
         let started = Instant::now();
@@ -169,6 +191,7 @@ impl Renderer {
             for input in &graph.inputs {
                 source_input(&mut cmd, input, &t.source.path);
             }
+            extra_inputs(&mut cmd, &graph.extra, &resolved, t);
             self.encode_args(&mut cmd, "graph.txt", graph.has_audio, t, encoder, opts);
             let mut m = run_with_progress(cmd, output, t.duration_us, on_progress)?;
             m.mode = "filtergraph".into();
@@ -220,6 +243,7 @@ impl Renderer {
             for k in 0..ranges.len() {
                 cmd.arg("-i").arg(format!("batch{k}.nut"));
             }
+            extra_inputs(&mut cmd, &graph.extra, &resolved, t);
             self.encode_args(&mut cmd, "join.txt", graph.has_audio, t, encoder, opts);
             let mut m = run_with_progress(cmd, output, t.duration_us, &mut |p| {
                 on_progress(Progress {
@@ -339,7 +363,9 @@ pub fn copy_eligible(t: &ResolvedTimeline) -> bool {
     let finishing = o.opening_pop
         || o.grade != detent_core::edl::ColorGrade::None
         || o.audio_mix != detent_core::edl::AudioMix::Source
-        || t.splices.iter().any(|s| s.flash);
+        || t.splices.iter().any(|s| s.flash)
+        || !t.inserts.is_empty()
+        || t.sound.is_some();
     !finishing && !t.needs_reframe() && t.captions.as_ref().is_none_or(|c| c.blocks.is_empty())
 }
 
@@ -350,6 +376,35 @@ fn source_input(cmd: &mut Command, input: &InputSpec, src: &str) {
         .arg(format!("{:.6}", input.duration_s))
         .arg("-i")
         .arg(src);
+}
+
+/// Insert and music inputs, in the graph's order: stills loop at the output
+/// frame rate, videos and music loop from their start.
+fn extra_inputs(
+    cmd: &mut Command,
+    extra: &[ExtraInput],
+    resolved: &[(String, PathBuf)],
+    t: &ResolvedTimeline,
+) {
+    let fps = t.output.fps;
+    for e in extra {
+        let path = resolved
+            .iter()
+            .find(|(f, _)| f == e.path())
+            .map_or_else(|| PathBuf::from(e.path()), |(_, p)| p.clone());
+        let len_s = match e {
+            ExtraInput::Still { len_s, .. } => {
+                cmd.args(["-loop", "1", "-framerate"])
+                    .arg(format!("{}/{}", fps.num, fps.den));
+                len_s
+            }
+            ExtraInput::Looped { len_s, .. } => {
+                cmd.args(["-stream_loop", "-1"]);
+                len_s
+            }
+        };
+        cmd.arg("-t").arg(format!("{len_s:.6}")).arg("-i").arg(path);
+    }
 }
 
 fn absolute(p: &Path) -> Result<PathBuf> {

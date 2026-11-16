@@ -32,14 +32,16 @@ use serde::{Deserialize, Serialize};
 use crate::camera::{Framing, SegmentCamera, solve_segment};
 use crate::captions::{TimedWord, chunk};
 use crate::edl::{
-    MIN_CLIP_MS, MotionPreset, OutputLayout, SemanticEdl, TransitionKind, VideoTransitionKind,
+    CutSfx, MIN_CLIP_MS, MotionPreset, OutputLayout, PopSfx, SemanticEdl, TransitionKind,
+    VideoTransitionKind,
 };
 use crate::error::{CoreError, Result, ValidationIssue};
 use crate::index::{MediaIndex, PauseKind};
 use crate::time::{FrameRate, US_PER_MS, UsRange, ms_to_us, us_to_ms};
 use crate::timeline::{
-    FrameRange, Layout, OutputFormat, ResolvedCaptions, ResolvedSegment, ResolvedTimeline, Splice,
-    TIMELINE_VERSION, TimelineSource,
+    FrameRange, Layout, OutputFormat, ResolvedCaptions, ResolvedChapter, ResolvedInsert,
+    ResolvedSegment, ResolvedSound, ResolvedTimeline, SfxEvent, SfxKind, Splice, TIMELINE_VERSION,
+    TimelineSource,
 };
 
 /// Solver tunables. Defaults encode common editorial practice.
@@ -665,8 +667,12 @@ impl EdlSolver {
                     .headline_duration_ms
                     .map(|d| ms_to_us(u64::from(d)).min(duration_us)),
                 highlight_words: edl.highlight_words.clone(),
+                word_colors: edl.word_colors.clone(),
+                chapters: resolve_chapters(edl, &segments, duration_us),
             }
         });
+        let inserts = resolve_inserts(edl, &segments, duration_us);
+        let sound = resolve_sound(edl, &segments, pinned, &inserts, duration_us);
 
         // Editorial sanity notes.
         if let Some(best) = edl
@@ -755,6 +761,8 @@ impl EdlSolver {
             segments,
             splices,
             captions,
+            inserts,
+            sound,
             duration_us,
         };
         let violations = timeline.verify();
@@ -1061,4 +1069,112 @@ impl EdlSolver {
             TransitionKind::Hard => None,
         })
     }
+}
+
+/// Output start of every EDL clip (one segment per clip at this stage).
+fn clip_start_us(segments: &[ResolvedSegment], clip: usize) -> Option<i64> {
+    segments.get(clip).map(|s| s.output_start_us)
+}
+
+/// Chapters on the output timeline: each runs until the next one starts.
+fn resolve_chapters(
+    edl: &SemanticEdl,
+    segments: &[ResolvedSegment],
+    duration_us: i64,
+) -> Vec<ResolvedChapter> {
+    let starts: Vec<(i64, &str)> = edl
+        .chapters
+        .iter()
+        .filter_map(|c| clip_start_us(segments, c.clip).map(|t| (t, c.text.trim())))
+        .collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(k, &(start_us, text))| ResolvedChapter {
+            text: text.to_owned(),
+            start_us,
+            end_us: starts.get(k + 1).map_or(duration_us, |n| n.0),
+        })
+        .filter(|c| c.end_us > c.start_us)
+        .collect()
+}
+
+/// Image cards on the output timeline, clamped to the edit's length.
+fn resolve_inserts(
+    edl: &SemanticEdl,
+    segments: &[ResolvedSegment],
+    duration_us: i64,
+) -> Vec<ResolvedInsert> {
+    edl.inserts
+        .iter()
+        .filter_map(|c| {
+            let start = clip_start_us(segments, c.clip)? + ms_to_us(u64::from(c.offset_ms));
+            let start_us = start.min(duration_us);
+            let end_us = (start + ms_to_us(u64::from(c.duration_ms))).min(duration_us);
+            (end_us > start_us).then(|| ResolvedInsert {
+                path: c.path.clone(),
+                start_us,
+                end_us,
+                placement: c.placement,
+            })
+        })
+        .collect()
+}
+
+/// Sound effects on the output timeline: one per cut between different clips
+/// (`pinned` marks the jump cuts made by dead-air removal, which stay silent),
+/// one per B-roll cutaway in and out, and one per card.
+fn resolve_sound(
+    edl: &SemanticEdl,
+    segments: &[ResolvedSegment],
+    pinned: &[bool],
+    inserts: &[ResolvedInsert],
+    duration_us: i64,
+) -> Option<ResolvedSound> {
+    let spec = edl.sound.as_ref()?;
+    let cut = match spec.cut_sfx {
+        CutSfx::None => None,
+        CutSfx::Whoosh => Some(SfxKind::Whoosh),
+        CutSfx::Click => Some(SfxKind::Click),
+    };
+    let mut sfx = Vec::new();
+    if let Some(kind) = cut {
+        for (k, s) in segments.iter().enumerate().skip(1) {
+            if !pinned.get(k - 1).copied().unwrap_or(false) {
+                sfx.push(SfxEvent {
+                    kind,
+                    at_us: s.output_start_us,
+                });
+            }
+        }
+        for i in inserts.iter().filter(|i| !i.placement.is_card()) {
+            sfx.push(SfxEvent {
+                kind,
+                at_us: i.start_us,
+            });
+            if i.end_us < duration_us {
+                sfx.push(SfxEvent {
+                    kind,
+                    at_us: i.end_us,
+                });
+            }
+        }
+    }
+    if spec.pop_sfx == PopSfx::Pop {
+        for i in inserts.iter().filter(|i| i.placement.is_card()) {
+            sfx.push(SfxEvent {
+                kind: SfxKind::Pop,
+                at_us: i.start_us,
+            });
+        }
+    }
+    sfx.retain(|e| (0..=duration_us).contains(&e.at_us));
+    sfx.sort_by_key(|e| e.at_us);
+    // Two effects closer than 120 ms smear into one noise: keep the first.
+    sfx.dedup_by(|b, a| b.at_us - a.at_us < 120_000);
+    Some(ResolvedSound {
+        sfx,
+        sfx_db: spec.sfx_db,
+        music: spec.music.clone(),
+    })
 }

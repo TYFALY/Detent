@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::camera::CameraPath;
 use crate::captions::CaptionBlock;
-use crate::edl::{AspectPreset, AudioMix, CaptionPosition, CaptionStyle, ColorGrade};
+use crate::edl::{
+    AspectPreset, AudioMix, CaptionPosition, CaptionStyle, ColorGrade, InsertPlacement, MusicSpec,
+    WordColor,
+};
 use crate::time::{FrameRate, UsRange};
 
 /// Current on-disk schema version of [`ResolvedTimeline`].
@@ -97,6 +100,36 @@ pub struct ResolvedCaptions {
     /// Words rendered with emphasis.
     #[serde(default)]
     pub highlight_words: Vec<String>,
+    /// Per-word accent colours.
+    #[serde(default)]
+    pub word_colors: Vec<WordColor>,
+    /// Section labels on the output timeline, in order, non-overlapping.
+    #[serde(default)]
+    pub chapters: Vec<ResolvedChapter>,
+}
+
+/// A section label on the output timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedChapter {
+    /// Label text.
+    pub text: String,
+    /// Output start (µs).
+    pub start_us: i64,
+    /// Output end (µs, exclusive).
+    pub end_us: i64,
+}
+
+/// An image/video card or B-roll cutaway on the output timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedInsert {
+    /// Image or video path as written in the EDL.
+    pub path: String,
+    /// Output start (µs).
+    pub start_us: i64,
+    /// Output end (µs, exclusive).
+    pub end_us: i64,
+    /// Placement preset.
+    pub placement: InsertPlacement,
 }
 
 /// Output raster.
@@ -185,8 +218,56 @@ pub struct ResolvedTimeline {
     pub splices: Vec<Splice>,
     /// Captions, if requested.
     pub captions: Option<ResolvedCaptions>,
+    /// Image/video cards and B-roll cutaways over the picture.
+    #[serde(default)]
+    pub inserts: Vec<ResolvedInsert>,
+    /// Sound design, if requested.
+    #[serde(default)]
+    pub sound: Option<ResolvedSound>,
     /// Total output duration (µs).
     pub duration_us: i64,
+}
+
+/// One synthesised sound effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum SfxKind {
+    /// Airy swoosh.
+    Whoosh,
+    /// Percussive click.
+    Click,
+    /// Bubbly pop.
+    Pop,
+}
+
+impl SfxKind {
+    /// How long before its anchor the effect starts (µs): a whoosh swells
+    /// into the cut, a click or pop lands on it.
+    pub fn lead_us(self) -> i64 {
+        match self {
+            Self::Whoosh => 250_000,
+            Self::Click | Self::Pop => 0,
+        }
+    }
+}
+
+/// A sound effect on the output timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SfxEvent {
+    /// Effect.
+    pub kind: SfxKind,
+    /// The moment it is anchored to (a cut or a card appearing), µs.
+    pub at_us: i64,
+}
+
+/// Resolved sound design.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedSound {
+    /// Effects, sorted by time.
+    pub sfx: Vec<SfxEvent>,
+    /// Effect level relative to the voice (dB).
+    pub sfx_db: f32,
+    /// Background music bed.
+    pub music: Option<MusicSpec>,
 }
 
 impl ResolvedTimeline {
@@ -354,6 +435,33 @@ impl ResolvedTimeline {
             }
             if c.blocks.windows(2).any(|w| w[1].start_us < w[0].end_us) {
                 v.push("caption blocks overlap".to_owned());
+            }
+            for (k, ch) in c.chapters.iter().enumerate() {
+                if ch.end_us <= ch.start_us || ch.start_us < 0 || ch.end_us > self.duration_us {
+                    v.push(format!("chapter {k}: invalid display range"));
+                }
+            }
+            if c.chapters.windows(2).any(|w| w[1].start_us < w[0].end_us) {
+                v.push("chapters overlap".to_owned());
+            }
+        }
+        for (k, ins) in self.inserts.iter().enumerate() {
+            if ins.end_us <= ins.start_us || ins.start_us < 0 || ins.end_us > self.duration_us {
+                v.push(format!("insert {k}: invalid display range"));
+            }
+        }
+        if let Some(s) = &self.sound {
+            if s.sfx
+                .iter()
+                .any(|e| e.at_us < 0 || e.at_us > self.duration_us)
+            {
+                v.push("sound effect outside the timeline".to_owned());
+            }
+            if s.sfx.windows(2).any(|w| w[1].at_us < w[0].at_us) {
+                v.push("sound effects not sorted".to_owned());
+            }
+            if !self.source.has_audio {
+                v.push("sound design without source audio".to_owned());
             }
         }
         v

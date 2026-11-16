@@ -11,7 +11,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::edl::{CaptionGrouping, CaptionPosition, CaptionStyle};
+use crate::edl::{AccentColor, CaptionGrouping, CaptionPosition, CaptionStyle, WordColor};
+use crate::timeline::ResolvedChapter;
 
 /// A word positioned on the output timeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -270,6 +271,10 @@ pub struct AssExtras<'a> {
     pub duration_us: i64,
     /// Ends the headline early (e.g. a 3-second hook banner).
     pub headline_end_us: Option<i64>,
+    /// Per-word accent colours (`WordPunch`, `WordBounce`, `BoldPop`).
+    pub word_colors: &'a [WordColor],
+    /// Persistent section labels.
+    pub chapters: &'a [ResolvedChapter],
 }
 
 /// Renders blocks to a complete `.ass` document for a `width x height` canvas.
@@ -410,6 +415,17 @@ pub fn to_ass_with(
             h * 0.005,
             h * 0.002,
         ),
+        CaptionStyle::WordPunch => (
+            "Arial Black",
+            h * 0.068,
+            -1,
+            "&H00FFFFFF",
+            "&H00FFFFFF",
+            "&H00000000",
+            "&H78000000",
+            h * 0.010,
+            h * 0.0035,
+        ),
         CaptionStyle::WordBounce => (
             "Arial Black",
             h * 0.062,
@@ -443,6 +459,16 @@ pub fn to_ass_with(
         h * 0.112,
         m = (f64::from(width) * 0.08).round(),
     ));
+    // Chapter label: yellow bold italic in the lower band, under the captions.
+    out.pop();
+    out.push_str(&format!(
+        "Style: Chapter,Arial Black,{:.0},&H0000E6FF,&H0000E6FF,&H00000000,&H78000000,-1,-1,0,0,100,100,0,0,1,{:.1},{:.1},2,{m},{m},{:.0},1\n\n",
+        h * 0.034,
+        h * 0.0055,
+        h * 0.002,
+        h * 0.19,
+        m = (f64::from(width) * 0.06).round(),
+    ));
     out.push_str("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
     if let Some(hl) = extras.headline.filter(|h| !h.trim().is_empty()) {
         let full = extras
@@ -456,8 +482,19 @@ pub fn to_ass_with(
             wrap_headline(hl)
         ));
     }
-    if style == CaptionStyle::WordBounce {
-        push_word_bounce(&mut out, blocks, extras.highlight_words);
+    for c in extras.chapters {
+        let text = sanitize(c.text.trim());
+        if c.end_us > c.start_us && !text.is_empty() {
+            out.push_str(&format!(
+                "Dialogue: 1,{},{},Chapter,,0,0,0,,{text}\n",
+                ass_time(c.start_us),
+                ass_time(c.end_us)
+            ));
+        }
+    }
+    let accents = Accents::new(extras.highlight_words, extras.word_colors);
+    if matches!(style, CaptionStyle::WordBounce | CaptionStyle::WordPunch) {
+        push_one_word(&mut out, blocks, style, &accents);
         return out;
     }
     for b in blocks {
@@ -483,7 +520,12 @@ pub fn to_ass_with(
             }
             let word = sanitize(&w.text);
             if style == CaptionStyle::BoldPop {
-                text.push_str(&word.to_uppercase());
+                match accents.color(&w.text) {
+                    Some(c) => {
+                        text.push_str(&format!(r"{{\c{c}}}{}{{\c&HFFFFFF&}}", word.to_uppercase()))
+                    }
+                    None => text.push_str(&word.to_uppercase()),
+                }
             } else {
                 text.push_str(&word);
             }
@@ -498,13 +540,48 @@ pub fn to_ass_with(
     out
 }
 
+/// Emphasis lookup: explicit `word_colors` win over `highlight_words` (green).
+struct Accents {
+    colors: Vec<(String, &'static str)>,
+}
+
+impl Accents {
+    fn new(highlight: &[String], colors: &[WordColor]) -> Self {
+        let mut v: Vec<(String, &'static str)> = colors
+            .iter()
+            .map(|c| (normalized(&c.word), c.color.ass()))
+            .collect();
+        v.extend(
+            highlight
+                .iter()
+                .map(|w| (normalized(w), AccentColor::Green.ass())),
+        );
+        v.retain(|(w, _)| !w.is_empty());
+        Self { colors: v }
+    }
+
+    fn color(&self, word: &str) -> Option<&'static str> {
+        let n = normalized(word);
+        self.colors.iter().find(|(w, _)| *w == n).map(|(_, c)| *c)
+    }
+}
+
 /// One dialogue event per word. Each word shows from its own start until the
 /// next word starts (the last word of a block holds to the block's end), so
 /// exactly one word is on screen at a time and nothing flickers between words.
-fn push_word_bounce(out: &mut String, blocks: &[CaptionBlock], highlight: &[String]) {
-    // Overshoot to 112% in 80 ms, settle to 100% by 160 ms.
-    const BOUNCE: &str = r"{\fscx72\fscy72\t(0,80,\fscx112\fscy112)\t(80,160,\fscx100\fscy100)}";
-    let hot: Vec<String> = highlight.iter().map(|w| normalized(w)).collect();
+fn push_one_word(
+    out: &mut String,
+    blocks: &[CaptionBlock],
+    style: CaptionStyle,
+    accents: &Accents,
+) {
+    let anim = if style == CaptionStyle::WordPunch {
+        // Slam in from 130% to 100% in 70 ms.
+        r"{\fscx130\fscy130\t(0,70,\fscx100\fscy100)}"
+    } else {
+        // Overshoot to 112% in 80 ms, settle to 100% by 160 ms.
+        r"{\fscx72\fscy72\t(0,80,\fscx112\fscy112)\t(80,160,\fscx100\fscy100)}"
+    };
     for b in blocks {
         for (i, w) in b.words.iter().enumerate() {
             let start = w.start_us.max(b.start_us);
@@ -521,14 +598,13 @@ fn push_word_bounce(out: &mut String, blocks: &[CaptionBlock], highlight: &[Stri
             if word.is_empty() {
                 continue;
             }
-            // Emphasised words: green, landing slightly bigger.
-            let tint = if hot.contains(&normalized(&w.text)) {
-                r"{\c&H5CFF39&\fscx115\fscy115}"
-            } else {
-                ""
-            };
+            // Emphasised words land in their colour, slightly bigger.
+            let tint = accents
+                .color(&w.text)
+                .map(|c| format!(r"{{\c{c}\fscx115\fscy115}}"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "Dialogue: 0,{},{},Default,,0,0,0,,{BOUNCE}{tint}{word}\n",
+                "Dialogue: 0,{},{},Default,,0,0,0,,{anim}{tint}{word}\n",
                 ass_time(start),
                 ass_time(end)
             ));
@@ -651,6 +727,8 @@ mod tests {
                 highlight_words: &hot,
                 duration_us: 5_000_000,
                 headline_end_us: None,
+                word_colors: &[],
+                chapters: &[],
             },
         );
         assert!(doc.contains("Style: Headline,"));
@@ -674,6 +752,8 @@ mod tests {
                 highlight_words: &hot,
                 duration_us: 5_000_000,
                 headline_end_us: Some(3_000_000),
+                word_colors: &[],
+                chapters: &[],
             },
         );
         let head = doc.lines().find(|l| l.contains(",Headline,,")).unwrap();
@@ -719,6 +799,91 @@ mod tests {
         assert!(events[0].ends_with("NORTH"));
         assert!(events.iter().all(|e| e.contains(r"\t(0,80,\fscx112")));
         assert!(doc.contains("&H0000E6FF"));
+    }
+
+    #[test]
+    fn word_punch_colours_keywords_and_shows_chapters() {
+        use crate::edl::{AccentColor, WordColor};
+        let blocks = chunk(
+            &words("joker is called akira kurusu"),
+            &[],
+            &CaptionGrouping::default(),
+            250_000,
+        );
+        let colors = [
+            WordColor {
+                word: "Joker?".into(),
+                color: AccentColor::Red,
+            },
+            WordColor {
+                word: "akira".into(),
+                color: AccentColor::Blue,
+            },
+        ];
+        let hot = vec!["joker".to_owned(), "kurusu".to_owned()];
+        let chapters = [ResolvedChapter {
+            text: "1. The Names".into(),
+            start_us: 0,
+            end_us: 2_000_000,
+        }];
+        let doc = to_ass_with(
+            &blocks,
+            CaptionStyle::WordPunch,
+            CaptionPosition::Center,
+            1080,
+            1920,
+            &AssExtras {
+                highlight_words: &hot,
+                word_colors: &colors,
+                chapters: &chapters,
+                duration_us: 3_000_000,
+                ..AssExtras::default()
+            },
+        );
+        let events: Vec<&str> = doc.lines().filter(|l| l.starts_with("Dialogue:")).collect();
+        // One chapter label plus one event per word.
+        assert_eq!(events.len(), 6, "{doc}");
+        assert!(events[0].contains(",Chapter,") && events[0].ends_with("1. The Names"));
+        assert!(doc.contains("Style: Chapter,"));
+        // White words that slam in from 130%.
+        assert!(doc.contains("Style: Default,Arial Black,131,&H00FFFFFF"));
+        assert!(
+            events[1..]
+                .iter()
+                .all(|e| e.contains(r"\fscx130\fscy130\t(0,70"))
+        );
+        // word_colors beat highlight_words; plain highlights stay green.
+        assert!(events[1].contains(r"\c&H3030FF&") && events[1].ends_with("JOKER"));
+        assert!(events[4].contains(r"\c&HFF9E2E&") && events[4].ends_with("AKIRA"));
+        assert!(events[5].contains(r"\c&H5CFF39&") && events[5].ends_with("KURUSU"));
+        assert!(!events[2].contains(r"\c&") && !events[3].contains(r"\c&"));
+    }
+
+    #[test]
+    fn bold_pop_colours_single_words() {
+        use crate::edl::{AccentColor, WordColor};
+        let blocks = chunk(
+            &words("this is huge"),
+            &[],
+            &CaptionGrouping::default(),
+            250_000,
+        );
+        let colors = [WordColor {
+            word: "huge".into(),
+            color: AccentColor::Yellow,
+        }];
+        let doc = to_ass_with(
+            &blocks,
+            CaptionStyle::BoldPop,
+            CaptionPosition::Lower,
+            1080,
+            1920,
+            &AssExtras {
+                word_colors: &colors,
+                ..AssExtras::default()
+            },
+        );
+        assert!(doc.contains(r"IS {\c&H00E6FF&}HUGE{\c&HFFFFFF&}"), "{doc}");
     }
 
     #[test]

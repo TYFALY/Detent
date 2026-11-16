@@ -2,8 +2,9 @@
 //! property-based invariant checks.
 
 use detent_core::edl::{
-    AspectPreset, AudioTransition, CaptionSpec, EdlClip, Intensity, MotionCue, MotionPreset,
-    OutputSpec, SemanticEdl, TightenSpec, TransitionKind, VideoTransition, VideoTransitionKind,
+    AccentColor, AspectPreset, AudioTransition, CaptionSpec, Chapter, CutSfx, EdlClip, Insert,
+    InsertPlacement, Intensity, MotionCue, MotionPreset, OutputSpec, PopSfx, SemanticEdl,
+    SoundSpec, TightenSpec, TransitionKind, VideoTransition, VideoTransitionKind, WordColor,
 };
 use detent_core::index::{
     AudioStreamInfo, AudioTelemetry, ExcitementPeak, INDEX_VERSION, MediaIndex, PauseKind,
@@ -12,6 +13,7 @@ use detent_core::index::{
 };
 use detent_core::solver::{Adjustment, EdlSolver, Level};
 use detent_core::time::FrameRate;
+use detent_core::timeline::SfxKind;
 use detent_core::{CoreError, ResolvedTimeline};
 use proptest::prelude::*;
 
@@ -90,6 +92,10 @@ fn edl(clips: Vec<EdlClip>) -> SemanticEdl {
         captions: None,
         headline: None,
         highlight_words: Vec::new(),
+        word_colors: Vec::new(),
+        chapters: Vec::new(),
+        inserts: Vec::new(),
+        sound: None,
         headline_duration_ms: None,
         video_transitions: Vec::new(),
         tighten: None,
@@ -205,6 +211,165 @@ fn tighten_and_flash_are_validated() {
     );
     assert!(paths.contains(&"/tighten/max_silence_ms"), "{paths:?}");
     assert!(paths.contains(&"/headline_duration_ms"), "{paths:?}");
+}
+
+#[test]
+fn chapters_and_inserts_follow_their_clips() {
+    let idx = talk();
+    let mut e = edl(vec![
+        clip(900, 2_300),
+        clip(2_900, 4_700),
+        clip(5_300, 6_700),
+    ]);
+    e.captions = Some(CaptionSpec::default());
+    e.chapters = vec![
+        Chapter {
+            clip: 0,
+            text: " 1. Hello ".into(),
+        },
+        Chapter {
+            clip: 2,
+            text: "2. Third".into(),
+        },
+    ];
+    e.inserts = vec![
+        Insert {
+            path: "card.png".into(),
+            clip: 1,
+            offset_ms: 200,
+            duration_ms: 1_000,
+            placement: InsertPlacement::Center,
+        },
+        // Runs past the end: clamped.
+        Insert {
+            path: "late.jpg".into(),
+            clip: 2,
+            offset_ms: 0,
+            duration_ms: 15_000,
+            placement: InsertPlacement::default(),
+        },
+    ];
+    let t = EdlSolver::default().solve(&e, &idx).unwrap().timeline;
+    assert!(t.verify().is_empty(), "{:?}", t.verify());
+    let starts: Vec<i64> = t.segments.iter().map(|s| s.output_start_us).collect();
+    let ch = &t.captions.as_ref().unwrap().chapters;
+    assert_eq!(ch.len(), 2);
+    assert_eq!((ch[0].text.as_str(), ch[0].start_us), ("1. Hello", 0));
+    assert_eq!(ch[0].end_us, starts[2]);
+    assert_eq!((ch[1].start_us, ch[1].end_us), (starts[2], t.duration_us));
+    assert_eq!(t.inserts.len(), 2);
+    assert_eq!(t.inserts[0].start_us, starts[1] + 200_000);
+    assert_eq!(t.inserts[0].end_us, starts[1] + 1_200_000);
+    assert_eq!(t.inserts[0].placement, InsertPlacement::Center);
+    assert_eq!(t.inserts[1].end_us, t.duration_us);
+    // The timeline round-trips through JSON with the new fields.
+    let back = ResolvedTimeline::from_json(&serde_json::to_string(&t).unwrap()).unwrap();
+    assert_eq!(back, t);
+
+    // With dead-air removal, chapters still start on their original clip.
+    e.tighten = Some(TightenSpec::default());
+    let t = EdlSolver::default().solve(&e, &idx).unwrap().timeline;
+    let first_of_2 = t.segments.iter().find(|s| s.clip_index == 2).unwrap();
+    let ch = &t.captions.as_ref().unwrap().chapters;
+    assert_eq!(ch[1].start_us, first_of_2.output_start_us);
+}
+
+#[test]
+fn chapters_and_inserts_are_validated() {
+    let idx = talk();
+    let mut e = edl(vec![clip(900, 2_300), clip(2_900, 4_700)]);
+    e.chapters = vec![
+        Chapter {
+            clip: 1,
+            text: "late".into(),
+        },
+        Chapter {
+            clip: 0,
+            text: "  ".into(),
+        },
+    ];
+    e.inserts = vec![Insert {
+        path: "clip.gif".into(),
+        clip: 5,
+        offset_ms: 0,
+        duration_ms: 100,
+        placement: InsertPlacement::Upper,
+    }];
+    e.word_colors = vec![WordColor {
+        word: String::new(),
+        color: AccentColor::Red,
+    }];
+    let Err(CoreError::Validation(issues)) = EdlSolver::default().solve(&e, &idx) else {
+        panic!("expected validation errors");
+    };
+    let paths: Vec<&str> = issues.iter().map(|i| i.path.as_str()).collect();
+    for p in [
+        "/chapters/0",
+        "/chapters/1/clip",
+        "/chapters/1/text",
+        "/inserts/0/clip",
+        "/inserts/0/duration_ms",
+        "/inserts/0/path",
+        "/word_colors/0/word",
+    ] {
+        assert!(paths.contains(&p), "missing {p}: {paths:?}");
+    }
+}
+
+#[test]
+fn sound_effects_land_on_clip_cuts_cards_and_cutaways() {
+    let idx = talk();
+    let mut e = edl(vec![clip(900, 6_700), clip(900, 2_300)]);
+    e.tighten = Some(TightenSpec::default());
+    e.inserts = vec![
+        Insert {
+            path: "card.png".into(),
+            clip: 0,
+            offset_ms: 300,
+            duration_ms: 800,
+            placement: InsertPlacement::Upper,
+        },
+        Insert {
+            path: "broll.mp4".into(),
+            clip: 0,
+            offset_ms: 1_500,
+            duration_ms: 1_000,
+            placement: InsertPlacement::Fullscreen,
+        },
+    ];
+    e.sound = Some(SoundSpec {
+        cut_sfx: CutSfx::Whoosh,
+        pop_sfx: PopSfx::Pop,
+        ..SoundSpec::default()
+    });
+    let t = EdlSolver::default().solve(&e, &idx).unwrap().timeline;
+    assert!(t.verify().is_empty(), "{:?}", t.verify());
+    let s = t.sound.as_ref().unwrap();
+    let whooshes: Vec<i64> = s
+        .sfx
+        .iter()
+        .filter(|x| x.kind == SfxKind::Whoosh)
+        .map(|x| x.at_us)
+        .collect();
+    // Clip 0 was split twice by tighten: those jump cuts stay silent, the
+    // cut into clip 1 and the cutaway's in and out get a whoosh.
+    let into_clip1 = t
+        .segments
+        .iter()
+        .find(|x| x.clip_index == 1)
+        .unwrap()
+        .output_start_us;
+    let cut_in = t.inserts[1].start_us;
+    let cut_out = t.inserts[1].end_us;
+    assert_eq!(whooshes, vec![cut_in, cut_out, into_clip1]);
+    let pops: Vec<i64> = s
+        .sfx
+        .iter()
+        .filter(|x| x.kind == SfxKind::Pop)
+        .map(|x| x.at_us)
+        .collect();
+    assert_eq!(pops, vec![t.inserts[0].start_us]);
+    assert!(s.music.is_none());
 }
 
 #[test]
@@ -752,6 +917,10 @@ fn arb_scenario() -> impl Strategy<Value = Scenario> {
                             captions: (caps && has_words).then(CaptionSpec::default),
                             headline: None,
                             highlight_words: Vec::new(),
+                            word_colors: Vec::new(),
+                            chapters: Vec::new(),
+                            inserts: Vec::new(),
+                            sound: None,
                             headline_duration_ms: None,
                             video_transitions: Vec::new(),
                             tighten: None,
