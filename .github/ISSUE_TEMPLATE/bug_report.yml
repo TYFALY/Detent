@@ -1,0 +1,66 @@
+name: Bug report
+description: Something is wrong with indexing, solving, rendering or the MCP server
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Security problems go through [SECURITY.md](https://github.com/TYFALY/detent/blob/main/SECURITY.md), not here.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Indexing (detent index / index_media)
+        - Solver (detent solve / solve_and_validate_edl)
+        - Rendering (detent render / render_timeline)
+        - MCP server / Claude integration
+        - Campaign check (detent check)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you expected, and what you got instead. Frame grabs or a short clip help a lot for visual bugs.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands or MCP tool calls.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: edl
+    attributes:
+      label: EDL / index (optional)
+      description: Paste the EDL, or attach the `index.json` (it holds timings and analysis, not your video).
+      render: json
+  - type: input
+    id: version
+    attributes:
+      label: detent version
+      placeholder: output of `detent --version`, or a commit hash
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: e.g. Windows 11, macOS 15, Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: ffmpeg
+    attributes:
+      label: FFmpeg version
+      placeholder: first line of `ffmpeg -version`
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      render: text

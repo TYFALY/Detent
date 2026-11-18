@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest an edit detent should be able to make
+labels: [enhancement]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: What edit are you trying to make?
+      description: Describe the result you want in the video (e.g. "zoom in when the speaker laughs"), not only the API.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What happens today?
+      description: How close can you get with the current EDL options, and what is missing?
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed EDL option (optional)
+      description: detent keeps the model's choices semantic, so options should be presets, styles or named moments, never pixel coordinates, frame numbers or FFmpeg filters.
+      render: json
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Reference videos, links, screenshots.

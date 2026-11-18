@@ -397,6 +397,10 @@ Tests that need FFmpeg skip with a message when it is not installed. CI runs `fm
 - Face detection runs on 320 px frames, so faces under roughly 1% of the frame width (a crowd far away) are not found; the saliency fallback then frames the motion. The built-in detector and ONNX Runtime find the same faces on the test photos (42 in a ~50-person group photo), checked by the gated `faces_photos` and `onnx_faces` tests.
 - Mouth motion is judged on the same 320 px frames, so faces under 24 px tall are treated as talking. That only ever costs a picture-side J/L cut (the splice gets a hard cut with a micro-crossfade instead), never a lip mismatch.
 
+## Contributing
+
+Bug reports, footage that trips up the solver, and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and checks, and [SECURITY.md](SECURITY.md) for reporting vulnerabilities privately. Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 MIT
