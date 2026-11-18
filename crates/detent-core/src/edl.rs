@@ -812,7 +812,7 @@ impl SemanticEdl {
             // (start, end, is_freeze) ranges to remove from inside the clip.
             let mut cuts: Vec<(u64, u64, bool)> = Vec::new();
             if drop_freezes {
-                for f in &index.visual.freezes {
+                for f in index.visual.freezes.iter().filter(|f| !f.still) {
                     if f.end_ms <= lo || f.start_ms >= hi {
                         continue;
                     }

@@ -42,6 +42,9 @@ pub struct IndexOptions {
     pub contact_sheet_path: Option<std::path::PathBuf>,
     /// Re-time raw ASR words against acoustic pauses (see `detent_core::align`).
     pub align_words: bool,
+    /// Stretches with no frames in the source (from its timestamps);
+    /// `index_file` fills this in from the file itself.
+    pub frame_gaps: Vec<detent_core::index::FreezeInterval>,
 }
 
 impl Default for IndexOptions {
@@ -55,6 +58,7 @@ impl Default for IndexOptions {
             contact_grid: Some((4, 4)),
             contact_sheet_path: None,
             align_words: true,
+            frame_gaps: Vec::new(),
         }
     }
 }
@@ -100,6 +104,8 @@ struct AudioOut {
 struct VideoOut {
     freezes: Vec<detent_core::index::FreezeInterval>,
     luma_per_s: Vec<f32>,
+    faceless_ms: Option<Vec<(u64, u64)>>,
+    lips_still_ms: Option<Vec<(u64, u64)>>,
     shots: Vec<ShotBoundary>,
     subjects: Vec<SubjectBox>,
     sheet: Option<ContactSheet>,
@@ -194,14 +200,18 @@ where
                 k += 1;
             }
             src.close()?;
+            let faceless_ms = detector.faceless_ms();
+            let lips_still_ms = detector.lips_still_ms();
             let sheet = match (sheet, &opts.contact_sheet_path) {
                 (Some(b), Some(p)) => Some(b.finish(p)?),
                 _ => None,
             };
-            let (freezes, luma_per_s) = freezes.finish(fps);
+            let (freezes, luma_per_s) = freezes.finish(fps, &opts.frame_gaps);
             Ok(Some(VideoOut {
                 freezes,
                 luma_per_s,
+                faceless_ms,
+                lips_still_ms,
                 shots: shots.finish(fps),
                 subjects,
                 sheet,
@@ -229,6 +239,8 @@ where
                 contact_sheet: v.sheet,
                 freezes: v.freezes,
                 luma_per_s: v.luma_per_s,
+                faceless_ms: v.faceless_ms,
+                lips_still_ms: v.lips_still_ms,
             },
             v.frames,
         ),
@@ -286,6 +298,14 @@ mod file {
         opts: &IndexOptions,
     ) -> Result<Indexed> {
         let source = crate::probe::probe(tools, path)?;
+        let mut opts = opts.clone();
+        if let Some(v) = &source.video {
+            opts.frame_gaps = crate::probe::frame_gaps(tools, path, v.fps).unwrap_or_else(|e| {
+                tracing::warn!("could not read frame timestamps: {e}");
+                Vec::new()
+            });
+        }
+        let opts = &opts;
         let pcm = match source.audio {
             Some(_) => Some(FfmpegPcm::spawn(tools, path, opts.dsp.sample_rate)?),
             None => None,

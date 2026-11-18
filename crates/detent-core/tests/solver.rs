@@ -645,6 +645,136 @@ fn j_l_downgraded_when_speech_is_continuous_on_both_sides() {
 }
 
 #[test]
+fn continuous_speech_moves_the_picture_when_no_face_is_on_screen() {
+    // Same splice as above, but the face detector saw nobody from 2.5 s to
+    // 3.8 s (a screen, a wide shot): the held frames show no lips, so the
+    // picture can be held over the next clip's words.
+    let mut idx = talk();
+    idx.visual.faceless_ms = Some(vec![(2_500, 3_800)]);
+    let mut e = edl(vec![clip(950, 2_990), clip(3_290, 4_700)]);
+    e.audio_transitions.push(AudioTransition {
+        after_clip: 0,
+        kind: TransitionKind::AutoJCut,
+        offset_ms: Some(300),
+    });
+    let res = EdlSolver::default().solve(&e, &idx).unwrap();
+    let t = &res.timeline;
+    assert!(t.verify().is_empty(), "{:?}", t.verify());
+    let applied = res.report.adjustments.iter().find_map(|a| match a {
+        Adjustment::JCut {
+            offset_ms,
+            picture_side,
+            ..
+        } => Some((*offset_ms, *picture_side)),
+        _ => None,
+    });
+    let (offset_ms, picture_side) = applied.unwrap_or_else(|| panic!("{:?}", res.report));
+    assert!(picture_side);
+    assert!((150..=300).contains(&offset_ms), "{offset_ms}");
+    assert!(t.segments[0].video.end_us > t.segments[0].audio.end_us);
+    // No words were dropped or leaked: the audio is where the hard cut was.
+    assert!(t.segments[0].audio.end_us <= 3_000_000);
+    assert!(t.segments[1].audio.start_us >= 3_250_000);
+}
+
+#[test]
+fn continuous_speech_moves_the_picture_over_a_listener() {
+    // A face is on screen in the held frames, but its mouth is still (the
+    // voice belongs to someone off screen): no lips can disagree.
+    let mut idx = talk();
+    idx.visual.faceless_ms = Some(Vec::new());
+    idx.visual.lips_still_ms = Some(vec![(2_500, 3_800)]);
+    let mut e = edl(vec![clip(950, 2_990), clip(3_290, 4_700)]);
+    e.audio_transitions.push(AudioTransition {
+        after_clip: 0,
+        kind: TransitionKind::AutoJCut,
+        offset_ms: Some(300),
+    });
+    let res = EdlSolver::default().solve(&e, &idx).unwrap();
+    assert!(res.timeline.verify().is_empty());
+    let picture_side = res.report.adjustments.iter().find_map(|a| match a {
+        Adjustment::JCut { picture_side, .. } => Some(*picture_side),
+        _ => None,
+    });
+    assert_eq!(picture_side, Some(true), "{:?}", res.report);
+    // A talking face in those frames (no still stretch) still blocks it.
+    idx.visual.lips_still_ms = Some(vec![(3_700, 3_800)]);
+    let res = EdlSolver::default().solve(&e, &idx).unwrap();
+    assert!(
+        res.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "jl_downgraded")
+    );
+}
+
+#[test]
+fn j_cut_into_a_slow_motion_clip() {
+    let idx = talk();
+    let mut e = edl(vec![clip(950, 2_300), clip(5_300, 6_700)]);
+    e.clips[1].speed = Some(0.5);
+    e.audio_transitions.push(AudioTransition {
+        after_clip: 0,
+        kind: TransitionKind::AutoJCut,
+        offset_ms: Some(250),
+    });
+    let res = EdlSolver::default().solve(&e, &idx).unwrap();
+    let t = &res.timeline;
+    assert!(t.verify().is_empty(), "{:?}", t.verify());
+    assert!(
+        !res.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.starts_with("jl_")),
+        "{:?}",
+        res.report.diagnostics
+    );
+    let o = t.splices[0].av_offset_us;
+    assert!(o >= 150_000, "{:?}", res.report);
+    // On the half-speed side the lead covers half as much source.
+    let s1 = &t.segments[1];
+    let lead_src = s1.video.start_us - s1.audio.start_us;
+    let h = t.splices[0].crossfade_us / 2;
+    assert!(
+        (lead_src - (o + h) / 2).abs() <= 2,
+        "lead {lead_src} vs offset {o} + handle {h}"
+    );
+}
+
+#[test]
+fn j_and_l_cuts_next_to_a_file_with_no_sound() {
+    let (a, b) = (talk(), silent_lagged());
+    for kind in [TransitionKind::AutoJCut, TransitionKind::AutoLCut] {
+        let mut e = edl(vec![
+            clip(950, 2_300),
+            on(1, 500, 1_900),
+            clip(5_300, 6_700),
+        ]);
+        for after_clip in [0, 1] {
+            e.audio_transitions.push(AudioTransition {
+                after_clip,
+                kind,
+                offset_ms: Some(250),
+            });
+        }
+        e.drop_freezes = false;
+        let res = EdlSolver::default()
+            .solve_sources(&e, &[a.clone(), b.clone()])
+            .unwrap();
+        let t = &res.timeline;
+        assert!(t.verify().is_empty(), "{kind:?}: {:?}", t.verify());
+        let applied = res
+            .report
+            .adjustments
+            .iter()
+            .filter(|a| matches!(a, Adjustment::JCut { .. } | Adjustment::LCut { .. }))
+            .count();
+        assert_eq!(applied, 2, "{kind:?}: {:?}", res.report);
+        assert!(t.splices.iter().all(|s| s.av_offset_us != 0));
+    }
+}
+
+#[test]
 fn every_splice_gets_a_crossfade_and_av_stays_locked() {
     let idx = talk();
     let res = EdlSolver::default()
@@ -1029,6 +1159,7 @@ fn silent_lagged() -> MediaIndex {
     idx.visual.freezes = vec![detent_core::index::FreezeInterval {
         start_ms: 2_000,
         end_ms: 2_600,
+        still: false,
     }];
     idx.visual.luma_per_s = vec![0.12; 6];
     idx
@@ -1113,6 +1244,30 @@ fn keeping_freezes_warns_instead() {
             .iter()
             .any(|d| d.code == "frozen_picture")
     );
+}
+
+#[test]
+fn still_lag_is_reported_but_not_cut() {
+    let (a, mut b) = (talk(), silent_lagged());
+    b.visual.freezes[0].still = true;
+    let r = EdlSolver::default()
+        .solve_sources(&edl(vec![on(1, 500, 4_000)]), &[a, b.clone()])
+        .unwrap();
+    assert_eq!(
+        r.timeline.segments.len(),
+        1,
+        "a still stall must not split the clip"
+    );
+    assert!(r.report.diagnostics.iter().any(|d| d.code == "still_lag"));
+    assert!(
+        !r.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "freezes_removed")
+    );
+    let d = b.digest(detent_core::index::DigestLimits::default());
+    assert!(d.freezes_ms.is_empty());
+    assert_eq!(d.still_lag_ms, vec![(2_000, 2_600)]);
 }
 
 #[test]

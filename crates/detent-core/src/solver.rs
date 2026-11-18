@@ -325,15 +325,30 @@ impl EdlSolver {
             edl.drop_freezes,
         );
         let mut notes = Vec::new();
-        if !edl.drop_freezes {
-            for (i, c) in edl.clips.iter().enumerate() {
-                let frozen: u64 = indexes[c.source]
+        for (i, c) in edl.clips.iter().enumerate() {
+            let overlap = |still: bool| -> u64 {
+                indexes[c.source]
                     .visual
                     .freezes
                     .iter()
+                    .filter(|f| f.still == still)
                     .filter(|f| f.start_ms < c.end_ms && f.end_ms > c.start_ms)
                     .map(|f| f.end_ms.min(c.end_ms) - f.start_ms.max(c.start_ms))
-                    .sum();
+                    .sum()
+            };
+            let hidden = overlap(true);
+            if hidden > 0 {
+                notes.push((
+                    Level::Info,
+                    "still_lag",
+                    Some(i),
+                    format!(
+                        "clip {i} contains {hidden} ms where the stream stalled during a still picture; it cannot be seen, so it stays in"
+                    ),
+                ));
+            }
+            if !edl.drop_freezes {
+                let frozen = overlap(false);
                 if frozen > 0 {
                     notes.push((
                         Level::Warning,
@@ -469,52 +484,64 @@ impl EdlSolver {
             video_ranges.push(FrameRange::new(fa, fb, fps));
         }
 
-        // 4. J/L offsets per splice (µs, + = J / audio leads, - = L / audio lags).
+        // 4. J/L offsets per splice (µs on the output clock, + = J / audio
+        // leads, - = L / audio lags). On each side the offset is converted to
+        // that clip's source time with its own speed, so a J/L cut works
+        // between clips at different speeds.
         let mut offsets = vec![0_i64; n.saturating_sub(1)];
+        let src_shift = |out_us: i64, i: usize| -> i64 {
+            let sp = speed_of(i);
+            if sp == 1.0 {
+                out_us
+            } else {
+                (out_us as f64 * sp).round() as i64
+            }
+        };
         for k in 0..n.saturating_sub(1) {
             let (kind, target_ms) = edl.transition_after(k);
             if kind == TransitionKind::Hard {
                 continue;
             }
             let (ia, ib) = (ix_of(k), ix_of(k + 1));
-            if ia.source.audio.is_none() || ib.source.audio.is_none() {
+            if ia.source.audio.is_none() && ib.source.audio.is_none() {
                 rep.diag(
                     Level::Warning,
                     "jl_no_audio",
                     Some(k),
-                    "J/L-cut requested but a side of the splice has no audio".into(),
-                );
-                continue;
-            }
-            if speed_of(k) != 1.0 || speed_of(k + 1) != 1.0 {
-                rep.diag(
-                    Level::Warning,
-                    "jl_speed_change",
-                    Some(k),
-                    format!("J/L-cut after clip {k} skipped: a side of the splice changes speed"),
+                    "J/L-cut requested but neither side of the splice has sound".into(),
                 );
                 continue;
             }
             let prev = if k == 0 { 0 } else { offsets[k - 1] };
-            let same_source = edl.clips[k].source == edl.clips[k + 1].source;
+            // Moving the picture splice keeps both clips on one frame grid
+            // only when they share a frame rate and play at normal speed.
+            let same_clock =
+                fps_of(k) == fps_of(k + 1) && speed_of(k) == 1.0 && speed_of(k + 1) == 1.0;
             let mut picture_side = false;
             let found = self
-                .find_jl_offset((ia, ib), &video_ranges, k, kind, target_ms, prev)
+                .find_jl_offset(
+                    (ia, ib),
+                    (speed_of(k), speed_of(k + 1)),
+                    &video_ranges,
+                    k,
+                    kind,
+                    target_ms,
+                    src_shift(prev, k),
+                )
                 .or_else(|| {
-                    if !same_source {
+                    if !same_clock {
                         return None;
                     }
                     let fps = fps_of(k);
                     let min_frames = fps.nearest_frame(ms_to_us(MIN_CLIP_MS)).max(1);
-                    let total_frames = fps.floor_frame(ia.duration_us());
                     let (o, a, b) = self.find_picture_shift(
-                        ia,
+                        (ia, ib),
                         fps,
                         &video_ranges,
                         k,
                         kind,
                         target_ms,
-                        (min_frames, total_frames),
+                        min_frames,
                     )?;
                     video_ranges[k] = a;
                     video_ranges[k + 1] = b;
@@ -546,7 +573,7 @@ impl EdlSolver {
                     "jl_downgraded",
                     Some(k),
                     format!(
-                        "{kind:?} after clip {k} downgraded to Hard: no speech-free {}-{target_ms} ms window on either side of the splice (the audio side needs both, the picture side needs the extra frames to be silent and inside one shot); a micro-crossfade is still applied",
+                        "{kind:?} after clip {k} downgraded to Hard: no {}-{target_ms} ms window works (moving the audio needs speech-free audio on both sides; moving the picture needs extra frames inside one shot that are speech-free or show no face, at one frame rate and normal speed); a micro-crossfade is still applied",
                         crate::edl::JL_OFFSET_RANGE_MS.start()
                     ),
                 ),
@@ -566,7 +593,10 @@ impl EdlSolver {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                UsRange::new(v.start_us - off(i as isize - 1), v.end_us - off(i as isize))
+                UsRange::new(
+                    v.start_us - src_shift(off(i as isize - 1), i),
+                    v.end_us - src_shift(off(i as isize), i),
+                )
             })
             .collect();
         let mut splices = Vec::with_capacity(n.saturating_sub(1));
@@ -760,8 +790,8 @@ impl EdlSolver {
                     break;
                 }
                 let speech = UsRange::new(
-                    s.video.start_us - off(i as isize - 1),
-                    s.video.end_us - off(i as isize),
+                    s.video.start_us - src_shift(off(i as isize - 1), i),
+                    s.video.end_us - src_shift(off(i as isize), i),
                 );
                 breaks.push(words.len());
                 for w in &indexes[s.source].transcript {
@@ -1136,10 +1166,16 @@ impl EdlSolver {
         }
     }
 
-    /// Largest feasible J/L offset (µs, signed) for the splice after clip `k`.
+    /// Largest feasible J/L offset (µs on the output clock, signed) for the
+    /// splice after clip `k`. `(sa, sb)` are the two clips' speeds (the
+    /// offset covers `o * speed` of each side's source); `prev_offset` is the
+    /// previous splice's offset in clip `k`'s source time. A file with no
+    /// sound plays silence, so its side is always safe to extend or trim.
+    #[allow(clippy::too_many_arguments)]
     fn find_jl_offset(
         &self,
         (ia, ib): (&MediaIndex, &MediaIndex),
+        (sa, sb): (f64, f64),
         v: &[FrameRange],
         k: usize,
         kind: TransitionKind,
@@ -1156,33 +1192,48 @@ impl EdlSolver {
         if candidates.last() != Some(&lo) {
             candidates.push(lo);
         }
+        let safe = |ix: &MediaIndex, r: UsRange| {
+            if ix.source.audio.is_some() {
+                ix.audio_range_is_safe(r, guard)
+            } else {
+                r.start_us >= 0 && r.end_us <= ix.duration_us()
+            }
+        };
+        let scaled = |o: i64, sp: f64| {
+            if sp == 1.0 {
+                o
+            } else {
+                (o as f64 * sp).round() as i64
+            }
+        };
         candidates.into_iter().find_map(|o_ms| {
             let o = ms_to_us(u64::from(o_ms));
+            let (oa, ob) = (scaled(o, sa), scaled(o, sb));
             // J: clip a loses its tail, clip b gains audio before its in-point.
             // L: clip b loses its head, clip a gains audio after its out-point.
             let (removed, removed_ix, added, added_ix, signed) = match kind {
                 TransitionKind::AutoJCut => (
-                    UsRange::new(a.end_us - o, a.end_us),
+                    UsRange::new(a.end_us - oa, a.end_us),
                     ia,
-                    UsRange::new(b.start_us - o, b.start_us),
+                    UsRange::new(b.start_us - ob, b.start_us),
                     ib,
                     o,
                 ),
                 TransitionKind::AutoLCut => (
-                    UsRange::new(b.start_us, b.start_us + o),
+                    UsRange::new(b.start_us, b.start_us + ob),
                     ib,
-                    UsRange::new(a.end_us, a.end_us + o),
+                    UsRange::new(a.end_us, a.end_us + oa),
                     ia,
                     -o,
                 ),
                 TransitionKind::Hard => return None,
             };
-            let a_len = (a.end_us - signed) - (a.start_us - prev_offset);
-            let b_len = b.end_us - (b.start_us - signed);
+            let a_len = (a.end_us - signed.signum() * oa) - (a.start_us - prev_offset);
+            let b_len = b.end_us - (b.start_us - signed.signum() * ob);
             (a_len >= min_audio
                 && b_len >= min_audio
-                && removed_ix.audio_range_is_safe(removed, guard)
-                && added_ix.audio_range_is_safe(added, guard))
+                && safe(removed_ix, removed)
+                && safe(added_ix, added))
             .then_some(signed)
         })
     }
@@ -1192,19 +1243,24 @@ impl EdlSolver {
     /// inserted. A J-cut holds clip `k`'s picture past its out point (its
     /// post-roll is shown under the next clip's first words); an L-cut starts
     /// the next clip's picture early (its pre-roll is shown under the end of
-    /// clip `k`). Only those extra frames must be speech-free (a closed mouth)
-    /// and inside a single shot, so this works when speech is continuous on
-    /// the other side. Returns the signed offset and the two new ranges.
+    /// clip `k`). Those extra frames must sit inside a single shot and must
+    /// not show a mismatched mouth: they are either speech-free (a closed
+    /// mouth) or show no face at all (a screen, gameplay, a wide or B-roll
+    /// shot, someone facing away), which the face detector records. So this
+    /// works when speech is continuous on both sides of the splice, as long
+    /// as nobody's lips are on screen in the frames that move. Both clips
+    /// must share `fps` and play at normal speed. Returns the signed offset
+    /// and the two new ranges.
     #[allow(clippy::too_many_arguments)]
     fn find_picture_shift(
         &self,
-        index: &MediaIndex,
+        (ia, ib): (&MediaIndex, &MediaIndex),
         fps: FrameRate,
         v: &[FrameRange],
         k: usize,
         kind: TransitionKind,
         target_ms: u32,
-        (min_frames, total_frames): (i64, i64),
+        min_frames: i64,
     ) -> Option<(i64, FrameRange, FrameRange)> {
         let lo = *crate::edl::JL_OFFSET_RANGE_MS.start();
         let target = target_ms.clamp(lo, *crate::edl::JL_OFFSET_RANGE_MS.end());
@@ -1216,21 +1272,29 @@ impl EdlSolver {
         }
         let hi_frames = fps.floor_frame(ms_to_us(u64::from(target)));
         // A shot boundary at frame `f` inside `frames` would flash a new shot.
-        let crosses_shot = |frames: std::ops::Range<i64>| {
+        let crosses_shot = |index: &MediaIndex, frames: std::ops::Range<i64>| {
             index
                 .visual
                 .shots
                 .iter()
                 .any(|s| frames.contains(&(s.frame as i64)))
         };
+        // The extra frames show no talking mouth that disagrees with the
+        // sound: either nothing is said there, or no face is visible.
+        let lips_ok = |index: &MediaIndex, r: UsRange| {
+            (index.source.audio.is_some() && index.audio_range_is_safe(r, guard))
+                || index.face_free(r)
+                || index.lips_still(r)
+        };
+        let total_frames = fps.floor_frame(ia.duration_us());
         (lo_frames..=hi_frames).rev().find_map(|d| match kind {
             TransitionKind::AutoJCut => {
                 let na = FrameRange::new(a.start_frame, a.end_frame + d, fps);
                 let nb = FrameRange::new(b.start_frame + d, b.end_frame, fps);
                 (na.end_frame <= total_frames
                     && nb.frames() >= min_frames
-                    && !crosses_shot(a.end_frame..na.end_frame)
-                    && index.audio_range_is_safe(UsRange::new(a.end_us, na.end_us), guard))
+                    && !crosses_shot(ia, a.end_frame..na.end_frame)
+                    && lips_ok(ia, UsRange::new(a.end_us, na.end_us)))
                 .then(|| (na.end_us - a.end_us, na, nb))
             }
             TransitionKind::AutoLCut => {
@@ -1238,8 +1302,8 @@ impl EdlSolver {
                 let nb = FrameRange::new(b.start_frame - d, b.end_frame, fps);
                 (nb.start_frame >= 0
                     && na.frames() >= min_frames
-                    && !crosses_shot(nb.start_frame + 1..b.start_frame + 1)
-                    && index.audio_range_is_safe(UsRange::new(nb.start_us, b.start_us), guard))
+                    && !crosses_shot(ib, nb.start_frame + 1..b.start_frame + 1)
+                    && lips_ok(ib, UsRange::new(nb.start_us, b.start_us)))
                 .then(|| (-(a.end_us - na.end_us), na, nb))
             }
             TransitionKind::Hard => None,

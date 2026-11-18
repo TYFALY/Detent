@@ -8,14 +8,16 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-default = ["dsp", "ffmpeg-cli"]
+default = ["dsp", "ffmpeg-cli", "faces"]
 # Pure-Rust audio analysis (always cheap; kept as a feature so the matrix is explicit).
 dsp = []
 # Decode media by streaming raw PCM / frames out of an `ffmpeg` child process.
 ffmpeg-cli = []
 # Word-level speech recognition via whisper.cpp (needs cmake + a C++ toolchain + clang for bindgen).
 whisper = ["dep:whisper-rs"]
-# ONNX Runtime face / subject detection.
+# Built-in face detection: UltraFace (embedded) run by the pure-Rust tract engine.
+faces = ["dep:tract-onnx"]
+# Face detection through ONNX Runtime instead (loaded at run time).
 onnx = ["dep:ort"]
 
 [dependencies]
@@ -27,6 +29,7 @@ image.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
 whisper-rs = { version = "0.16", optional = true }
+tract-onnx = { version = "0.23", optional = true, default-features = false }
 ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "load-dynamic", "api-24"] }
 
 [dev-dependencies]

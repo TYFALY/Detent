@@ -162,8 +162,10 @@ pub struct ShotBoundary {
 pub enum SubjectSource {
     /// Pure-Rust motion + contrast saliency centroid.
     Saliency,
-    /// ONNX face / person detector.
+    /// ONNX Runtime face detector (`onnx` feature).
     Onnx,
+    /// Built-in face detector (UltraFace run in pure Rust, `faces` feature).
+    Face,
 }
 
 /// A normalised subject bounding box sample.
@@ -228,6 +230,16 @@ pub struct VisualTelemetry {
     /// Mean luma (0 black .. 1 white) of each second of video.
     #[serde(default)]
     pub luma_per_s: Vec<f32>,
+    /// Stretches `[start_ms, end_ms]` where the face detector looked and saw
+    /// no face at all. `None` when no face detector ran (then nothing is
+    /// known about faces).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faceless_ms: Option<Vec<(u64, u64)>>,
+    /// Stretches `[start_ms, end_ms]` where no visible mouth moved: no face,
+    /// or every face's mouth stayed still (listeners). `None` when no face
+    /// detector ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lips_still_ms: Option<Vec<(u64, u64)>>,
 }
 
 /// A frozen-picture stretch: `[start_ms, end_ms)` repeats the frame before
@@ -238,6 +250,11 @@ pub struct FreezeInterval {
     pub start_ms: u64,
     /// First new frame after the freeze (ms).
     pub end_ms: u64,
+    /// The stream stalled (its frame timestamps have a gap) while the picture
+    /// was still on both sides, so the freeze cannot be seen. Still freezes
+    /// are reported but not cut.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub still: bool,
 }
 
 impl VisualTelemetry {
@@ -404,8 +421,8 @@ impl MediaIndex {
         if s.len() < 5 {
             return None;
         }
-        let small = s.iter().filter(|b| b.w < PIP_MAX_WIDTH).count();
-        Some(if small * 10 >= s.len() * 6 {
+        let boxes: Vec<&SubjectBox> = s.iter().collect();
+        Some(if looks_like_inset(&boxes) {
             FramingHint::PipFacecam
         } else {
             FramingHint::FullFrameSubject
@@ -435,6 +452,27 @@ impl MediaIndex {
         } else {
             !self.words_overlap(range, guard_us)
         }
+    }
+
+    /// True when the face detector saw no face anywhere in `range` (so no
+    /// lips can be seen moving there).
+    pub fn face_free(&self, range: UsRange) -> bool {
+        let Some(free) = &self.visual.faceless_ms else {
+            return false;
+        };
+        free.iter()
+            .any(|&(a, b)| ms_to_us(a) <= range.start_us && range.end_us <= ms_to_us(b))
+    }
+
+    /// True when no visible mouth moves anywhere in `range` (nobody on
+    /// screen is talking), so the picture there can sit under any sound.
+    pub fn lips_still(&self, range: UsRange) -> bool {
+        let Some(still) = &self.visual.lips_still_ms else {
+            return false;
+        };
+        still
+            .iter()
+            .any(|&(a, b)| ms_to_us(a) <= range.start_us && range.end_us <= ms_to_us(b))
     }
 
     /// Linearly interpolated subject centre at `t_ms`, if subjects exist.
@@ -468,9 +506,50 @@ impl MediaIndex {
     }
 }
 
-/// Subject boxes narrower than this (fraction of frame width) are treated as
-/// a picture-in-picture facecam, not a person in the scene.
+/// Saliency boxes narrower than this (fraction of frame width) are treated
+/// as a picture-in-picture facecam, not a person in the scene.
 pub const PIP_MAX_WIDTH: f32 = 0.12;
+/// The same for face boxes, which cover the face only: a talking head's face
+/// is 10-30% of the frame width, a facecam's face under 7%. Small faces also
+/// appear in wide shots of several people, so a face counts as an inset only
+/// when it also stays put near an edge of the frame.
+pub const PIP_MAX_FACE_WIDTH: f32 = 0.07;
+
+/// Whether these subject boxes (one shot or a whole file) are a
+/// picture-in-picture facecam rather than people in the scene.
+///
+/// Saliency boxes: the median box is narrower than [`PIP_MAX_WIDTH`]. Face
+/// boxes: the median face is narrower than [`PIP_MAX_FACE_WIDTH`], the faces
+/// barely move (the middle 80% of centres spans under 12% of the frame both
+/// ways) and they sit off-centre, near an edge. A wide shot of people moving
+/// around a stage therefore stays trackable.
+pub fn looks_like_inset(boxes: &[&SubjectBox]) -> bool {
+    if boxes.is_empty() {
+        return false;
+    }
+    let faces = boxes
+        .iter()
+        .filter(|b| b.source != SubjectSource::Saliency)
+        .count();
+    let mut widths: Vec<f32> = boxes.iter().map(|b| b.w).collect();
+    widths.sort_by(f32::total_cmp);
+    let median_w = widths[widths.len() / 2];
+    if faces * 2 < boxes.len() {
+        return median_w < PIP_MAX_WIDTH;
+    }
+    if median_w >= PIP_MAX_FACE_WIDTH {
+        return false;
+    }
+    let spread = |mut v: Vec<f64>| -> (f64, f64) {
+        v.sort_by(f64::total_cmp);
+        let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+        (at(0.9) - at(0.1), at(0.5))
+    };
+    let (sx, mx) = spread(boxes.iter().map(|b| b.center().0).collect());
+    let (sy, my) = spread(boxes.iter().map(|b| b.center().1).collect());
+    let near_edge = !(0.3..=0.7).contains(&mx) || !(0.3..=0.7).contains(&my);
+    sx < 0.12 && sy < 0.12 && near_edge
+}
 
 /// What the footage looks like, from the subject detector's point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -514,6 +593,10 @@ pub struct IndexDigest {
     /// out of chosen clips unless the EDL sets `drop_freezes: false`.
     #[serde(default)]
     pub freezes_ms: Vec<(u64, u64)>,
+    /// Stream stalls inside a still picture `[start_ms, end_ms]`: found from
+    /// the file's frame timestamps, invisible, so they are left in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub still_lag_ms: Vec<(u64, u64)>,
     /// Mean brightness of the whole video (0 black .. 1 white); below ~0.3
     /// consider `output.exposure`.
     #[serde(default)]
@@ -638,6 +721,14 @@ impl MediaIndex {
                 .visual
                 .freezes
                 .iter()
+                .filter(|f| !f.still)
+                .map(|f| (f.start_ms, f.end_ms))
+                .collect(),
+            still_lag_ms: self
+                .visual
+                .freezes
+                .iter()
+                .filter(|f| f.still)
                 .map(|f| (f.start_ms, f.end_ms))
                 .collect(),
             mean_luma: self

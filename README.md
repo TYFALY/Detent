@@ -3,7 +3,7 @@
 **Turn a 2-hour stream, podcast or talking-head video into tight vertical clips by talking to Claude. No timeline, no cloud upload, and no cuts that land mid-word.**
 
 [![CI](https://github.com/TYFALY/detent/actions/workflows/ci.yml/badge.svg)](https://github.com/TYFALY/detent/actions/workflows/ci.yml)
-![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)
+![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)
 ![MCP](https://img.shields.io/badge/MCP-server-blueviolet)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
@@ -28,7 +28,7 @@ detent: 5 cuts snapped into breath gaps, 0 inside words, dead air removed,
 |---|---|
 | Cut the preamble, open on the hook | The model scores every clip's `hook_score`; the solver warns when a stronger hook is buried |
 | Kill dead air (> 0.2 s) | `tighten` splits clips at every silence or breath longer than the threshold and never touches a word |
-| Seamless conversation cuts | Automatic J/L-cuts (150-300 ms): the audio cut moves when both sides have a pause, the picture cut moves when only one side does, plus 15-25 ms equal-power crossfades on every splice |
+| Seamless conversation cuts | Automatic J/L-cuts (150-300 ms): the audio cut moves when both sides have a pause, the picture cut moves when only one side does or when no face is on screen, plus 15-25 ms equal-power crossfades on every splice. They also work into and out of slow-mo clips and clips from files with no sound |
 | No flash frames | Cuts within 150 ms of a camera change move onto it exactly |
 | Pattern interrupts | `SpringPunchIn` zooms (1.06-1.15x) land just before vocal emphasis peaks with a critically damped spring: no overshoot, no jitter |
 | Open with motion | `opening_pop`: 100% → 108% smoothstep scale-in over the first 0.4 s |
@@ -37,18 +37,18 @@ detent: 5 cuts snapped into breath gaps, 0 inside words, dead air removed,
 | Show the receipts (B-roll) | `inserts`: images or video clips pop over the A-roll as yellow-bordered cards (50% → 105% → 100% in 0.16 s), or cut to full-frame cutaways while the voice keeps playing |
 | Sound design | `sound`: synthesised whoosh or click on every cut between clips and on cutaways (not on `tighten` jump cuts), a pop on every card, and your music track normalised, laid ~20 dB under the voice and ducked while someone talks |
 | Signpost the steps | `chapters`: a persistent yellow label ("3. Make a Bootable USB") that switches at the clip you name |
-| The right layout | `Crop` for talking heads with subject tracking; `FitBlur` / `FitBlurTall` for gameplay, screen shares and facecam streams |
+| The right layout | `Crop` for talking heads with face tracking (a built-in face detector, no download); `FitBlur` / `FitBlurTall` for gameplay, screen shares and facecam streams |
 | Intentional transitions | Clean cuts by default; `Flash` (4 white frames) for kills, shocks and beat drops |
 | Phone-ready finish | `grade: MobilePop` (+8% contrast, +5% saturation, light sharpen) and `audio_mix: VoiceForward` (rumble cut, 3:1 compression, -14 LUFS, -3 dBTP peaks) |
 | Cut across a whole footage folder | `detent index footage/` indexes every video; each clip names its `source`, so one edit mixes many files. Different resolutions and frame rates are converted, and files with no sound track play silence |
-| Never show stream lag | The indexer finds frozen-picture stretches (repeated frames or timestamp gaps from a lagging stream capture, but never a genuinely still shot) and the solver cuts them out of every clip |
+| Never show stream lag | The indexer finds stalls three ways: gaps in the frame timestamps (captures that store nothing while the stream stalls), repeated frames between moving ones, and runs of bit-identical frames inside live camera noise (captures that duplicate frames while stalling; a camera never produces two identical frames). The solver cuts them out of every clip. A stall inside a still picture is reported as `still_lag_ms` and left in, because nobody can see it. Files whose timestamp gaps cover more than half their length (screen recorders that store frames only on change) are judged by the picture alone |
 | Text with no speech behind it | `texts`: "show this from here to here" lines for music trailers and silent product footage. `headline` and `chapters` no longer need a transcript either |
 | Slow-mo replays | `speed` from 0.25x to 4x per clip, with pitch-kept audio: repeat the payoff at 0.5x right after it plays |
 | Dark footage, progress bar, logo | `output.exposure: Auto` lifts only the dark clips (measured per second while indexing); `output.progress_bar` draws a filling bar; `logo` places a watermark |
 | Upload limits | `--max-size-mb 9.5` (Instagram's web uploader rejects files over 10 MB): the bitrate is computed from the length and the encode is redone lower if the file still comes out too big |
 | Campaign rules | `detent check rules.json` tests the edit, the file and the caption against a paid campaign's rules (approved caption lines word for word, allowed hashtags and mentions, banned words on screen, no music, official footage only, 9:16, size) and prints the steps only a person can do |
 
-Everything runs on your machine with FFmpeg, local whisper.cpp and an optional ONNX face detector. Hardware encoding (NVENC, VideoToolbox, VA-API) is detected and verified automatically.
+Everything runs on your machine with FFmpeg, local whisper.cpp and a face detector built into the binary. Hardware encoding (NVENC, VideoToolbox, VA-API) is detected and verified automatically.
 
 If detent saves you an afternoon of scrubbing timelines, a ⭐ helps other people find it.
 
@@ -71,7 +71,7 @@ flowchart LR
         A["ffmpeg → 16 kHz mono PCM"] --> DSP["RMS · ZCR · FFT flux<br/>pauses · breaths · peaks"]
         A --> ASR["Transcriber<br/>(whisper.cpp / JSON import)"]
         V["ffmpeg → 160 px RGB frames"] --> SH["shot detector (cuts, dissolves, fades)"]
-        V --> SAL["subject saliency / ONNX faces"]
+        V --> SAL["faces (UltraFace in tract) + saliency fallback"]
         V --> CS["contact sheet grid.jpg"]
     end
     DSP & ASR & SH & SAL & CS --> MI[("MediaIndex<br/>index.json")]
@@ -90,18 +90,18 @@ flowchart LR
 | Crate | Responsibility | I/O |
 |---|---|---|
 | `detent-core` | `MediaIndex`, `SemanticEdl` schema, streaming DSP, spring camera, caption chunker, `EdlSolver`, `ResolvedTimeline` + invariant checker | none (pure) |
-| `detent-indexer` | Decoder traits, FFmpeg streaming decoders, shot detection, saliency, contact sheets, `whisper` / `onnx` adapters | FFmpeg child processes |
+| `detent-indexer` | Decoder traits, FFmpeg streaming decoders, shot detection, face detection (pure Rust) with saliency fallback, freeze and timestamp-gap detection, contact sheets, `whisper` / `onnx` adapters | FFmpeg child processes |
 | `detent-renderer` | Encoder discovery, filtergraph compiler, render execution (EDLs over 32 clips render in lossless FFV1 batches, then one join pass applies the cross-batch crossfades, grade and captions), stream-copy preview | FFmpeg child processes |
 | `detent-mcp` | `rmcp` stdio server with five tools | stdio |
 | `detent-cli` | `detent index · solve · render · check · mcp · schema · encoders · bench` | filesystem |
 
 ## Quick start
 
-Requires Rust ≥ 1.88 and FFmpeg/ffprobe on `PATH` (or set `DETENT_FFMPEG` / `DETENT_FFPROBE`).
+Requires Rust ≥ 1.91 and FFmpeg/ffprobe on `PATH` (or set `DETENT_FFMPEG` / `DETENT_FFPROBE`).
 
 ### Without ML models
 
-Everything below is pure Rust plus FFmpeg. Subject framing uses the built-in saliency heuristic, and word timings come from a transcript you import.
+Everything below is pure Rust plus FFmpeg. Subject framing uses the built-in face detector (the 1.2 MB UltraFace model is compiled into the binary and run by [tract](https://github.com/sonos/tract), so there is nothing to download), and word timings come from a transcript you import.
 
 ```bash
 cargo install --path crates/detent-cli
@@ -124,7 +124,7 @@ detent render talk.mp4.detent/timeline.json -o short.mp4 --preview
 ### With local ML models (no C++ toolchain needed)
 
 1. **Speech.** Download a prebuilt `whisper-cli` from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) and a ggml model such as `ggml-base.en.bin`.
-2. **Faces.** Build with `--features onnx`, then download [ONNX Runtime](https://github.com/microsoft/onnxruntime/releases) 1.24+ and the UltraFace model `version-RFB-320.onnx`.
+2. **Faces (optional).** Faces are detected out of the box. To run the same model through ONNX Runtime instead (for example with a GPU provider), build with `--features onnx` and download [ONNX Runtime](https://github.com/microsoft/onnxruntime/releases) 1.24+ and `version-RFB-320.onnx`.
 3. Point detent at them:
 
 ```bash
@@ -256,7 +256,7 @@ a_in(i)  = v_in(i)  − o(i−1)
 a_out(i) = v_out(i) − o(i)
 ```
 
-Lip sync is preserved inside every clip, and Σ audio = Σ video telescopically. The solver tries the requested offset, then shorter ones in 10 ms steps down to 150 ms, and accepts the first offset for which both the audio *removed* and the audio *inserted* are speech-free (or inside detected pauses when there is no transcript). If none qualifies, it tries the **picture side**: the audio splice stays where breath snapping put it and the video splice moves instead (a J-cut holds the outgoing picture over the next clip's first words; an L-cut shows the incoming picture early). That only needs the extra frames to be speech-free (a closed mouth) and inside one shot, so it works when speech is continuous on the other side. The same formula applies with the shifted video ranges, so no audio is removed or inserted. Only when both sides are continuous speech is the splice downgraded to `Hard`, with a diagnostic.
+Lip sync is preserved inside every clip, and Σ audio = Σ video telescopically. Offsets live on the output clock: a clip playing at speed `s` covers `o·s` of its own source, so a J-cut into a half-speed replay leads with half as much source audio and the sums still balance. The solver tries the requested offset, then shorter ones in 10 ms steps down to 150 ms, and accepts the first offset for which both the audio *removed* and the audio *inserted* are speech-free (or inside detected pauses when there is no transcript). A file with no sound track plays silence, so its side always qualifies. If none qualifies, it tries the **picture side**: the audio splice stays where breath snapping put it and the video splice moves instead (a J-cut holds the outgoing picture over the next clip's first words; an L-cut shows the incoming picture early). The extra frames must be inside one shot and must not show a mouth that disagrees with the sound: either nothing is said there, or nobody on screen is talking: the face detector saw no face (`faceless_ms`: a screen, gameplay, a B-roll shot, someone facing away) or every visible mouth stayed still (`lips_still_ms`: listeners while someone off screen speaks). Each face is aligned between scans on its eyes and nose first, so camera shake and nodding do not count as talking. So the picture can move even when speech is continuous on both sides, as long as no visible mouth moves in the frames that shift. A face counts as talking for 600 ms around each scan where its mouth moved, and a frozen frame counts as talking, so a listener's twitch can only cost a J/L cut, never a lip mismatch. When someone on screen *is* talking through the frames that would shift and speech runs on both sides, every shift would drop or leak a word or show lips that disagree with the sound, so the solver makes a hard cut with a micro-crossfade and says why in a `jl_downgraded` diagnostic. The same formula applies with the shifted video ranges, so no audio is removed or inserted. Moving the picture needs both clips at one frame rate and normal speed; moving the audio does not.
 
 **5. Micro-crossfades (15–25 ms).** Every splice gets an equal-power crossfade (`qsin`/`qsin`, so sin² + cos² = 1). It is centred on the audio cut by extending both sides by `c/2` of real source audio. That makes `Σ audio − Σ crossfades = Σ video` hold **exactly** in microseconds, so the A/V offset never accumulates.
 
@@ -376,7 +376,7 @@ cargo test --workspace
 |---|---|
 | `detent-core` unit tests | DSP (−3 dBFS sine, chunk-size invariance, silence/breath placement, peak spacing), rational time, EDL strictness and schema, spring closed form, RDP, captions, `.ass` escaping |
 | `detent-core` property tests | spring: no overshoot, target-hull containment, monotone tracking; camera: bounded crops and exact aspect; RDP error bound; captions: order, size and weak-ending rules; **solver**: every invariant above for random indices/EDLs (5 frame rates, any aspect, ± transcript/audio), bounded cut movement, determinism |
-| `detent-indexer` | ffprobe parsing (rotation, cover art, NTSC rates), shot detector, saliency tracking (follows one of two people instead of the gap between them, and switches exactly once when the other starts moving), chunked ASR windowing, contact sheets, dissolve and fade-through-black detection (and no false hits on drift or slow pans); **FFmpeg integration**: a synthetic MP4 is cut at exactly frame 75 and its silent gap is found within 50 ms; a real `xfade` dissolve and `fadeblack` are each found once; **native whisper** transcribes synthesised speech (gated on `DETENT_WHISPER_MODEL`) |
+| `detent-indexer` | ffprobe parsing (rotation, cover art, NTSC rates), shot detector, saliency tracking (follows one of two people instead of the gap between them, and switches exactly once when the other starts moving), face tracking (a waving hand never pulls the camera off the face, one-scan false positives are ignored, a missed face holds then falls back to saliency, face-free stretches are recorded), freeze detection (picture repeats and frame-timestamp gaps, including a stall inside a still shot), **real photos** through the built-in detector (gated on `DETENT_FACE_IMAGES`), chunked ASR windowing, contact sheets, dissolve and fade-through-black detection (and no false hits on drift or slow pans); **FFmpeg integration**: a synthetic MP4 is cut at exactly frame 75 and its silent gap is found within 50 ms; a real `xfade` dissolve and `fadeblack` are each found once; **native whisper** transcribes synthesised speech (gated on `DETENT_WHISPER_MODEL`) |
 | `detent-renderer` | encoder discovery parsing, filtergraph golden tests, hinge-expression property test; **end-to-end**: index → solve (punch-in, tracking, L-cut, captions) → render has **exactly** the solved frame count, with audio within 50 ms of video; stream-copy preview; tampered timelines rejected; **batched rendering** (1 and 3 segments per process) gives the same frame count and A/V length as a single pass |
 | `detent-mcp` | spawns the real binary and speaks JSON-RPC over stdio: initialize, tools/list, a hallucinated field rejected, index → validation issues → solve → render → inspect |
 
@@ -389,14 +389,13 @@ Tests that need FFmpeg skip with a message when it is not installed. CI runs `fm
 | `dsp` | yes | Pure-Rust audio analysis |
 | `ffmpeg-cli` | yes | Streaming decoders over an `ffmpeg` child process |
 | `whisper` | no | Native `whisper-rs` (whisper.cpp) ASR, streamed in ≤ 28 s windows cut at the quietest point. Without it, `--whisper-model` runs a prebuilt `whisper-cli` subprocess instead |
-| `onnx` | no | UltraFace face detection through `ort`, with ONNX Runtime loaded at run time (`ORT_DYLIB_PATH`). Set `DETENT_FACE_MODEL=version-RFB-320.onnx` to use it; frames are letterboxed (no distortion), deduplicated with NMS, and one primary subject is chosen with hysteresis so the camera does not hop between faces in a crowd |
+| `faces` | yes | Built-in face detection: the UltraFace RFB-320 model (MIT, 1.2 MB) is embedded and run by the pure-Rust `tract` engine at ~25 ms per frame. Frames are letterboxed (no distortion), deduplicated with NMS, and one primary face is followed with hysteresis so the camera does not hop between people. A new face must be seen in two scans in a row before the camera moves to it, a missed face holds the framing for 1.5 s, and with nobody in shot the motion-saliency tracker takes over. Set `DETENT_SUBJECTS=saliency` to use the heuristic alone |
+| `onnx` | no | The same UltraFace pipeline through `ort`, with ONNX Runtime loaded at run time (`ORT_DYLIB_PATH`). Set `DETENT_FACE_MODEL=version-RFB-320.onnx` to use it |
 
 ## Limitations
 
-- The default subject tracker is still a heuristic, not a face detector. It splits motion and skin-tone saliency into blobs and follows one subject with hysteresis, preferring whoever moves. In a two-person shot it frames a person rather than the wall between them, but it can mistake a gesturing hand for a head. Use `onnx` for real face detection; against ONNX Runtime 1.24.4 it found 42 faces in a ~50-person group photo, and the gated `onnx_faces` test checks box sanity and subject stability on real photos.
-- Freeze detection needs motion on both sides of the freeze, so a lag that happens during an already still shot is not reported (it is also invisible). Variable-frame-rate captures are resampled to their nominal rate while indexing and rendering, which turns timestamp gaps into repeated frames that the detector then finds.
-- J/L cuts are skipped at a splice where either clip changes speed or comes from a file with no sound.
-- A J/L cut is downgraded to a hard cut (with a micro-crossfade) only when speech is continuous on *both* sides of the splice, so neither the audio nor the picture can move without leaking or dropping a word.
+- Face detection runs on 320 px frames, so faces under roughly 1% of the frame width (a crowd far away) are not found; the saliency fallback then frames the motion. The built-in detector and ONNX Runtime find the same faces on the test photos (42 in a ~50-person group photo), checked by the gated `faces_photos` and `onnx_faces` tests.
+- Mouth motion is judged on the same 320 px frames, so faces under 24 px tall are treated as talking. That only ever costs a picture-side J/L cut (the splice gets a hard cut with a micro-crossfade instead), never a lip mismatch.
 
 ## License
 

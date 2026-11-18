@@ -63,7 +63,12 @@ fn detects_and_tracks_faces_in_real_photos() {
                 boxes.push(b);
             }
         }
-        assert_eq!(boxes.len(), 10);
+        // The first sighting only arms the tracker; the next nine confirm.
+        let boxes: Vec<_> = boxes
+            .into_iter()
+            .filter(|b| b.source == detent_core::index::SubjectSource::Onnx)
+            .collect();
+        assert_eq!(boxes.len(), 9);
         assert!(boxes.windows(2).all(|w| (w[0].x - w[1].x).abs() < 1e-6));
     }
 }

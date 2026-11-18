@@ -7,8 +7,10 @@
 //! hysteresis. With several people in frame it therefore locks onto one of
 //! them (preferring the one who moves, i.e. talks or gestures, and staying
 //! with them until another is clearly more active) instead of averaging to
-//! the empty space between them. It is not a face detector and needs no ML
-//! runtime; enable the `onnx` feature for a learned detector.
+//! the empty space between them. It is not a face detector: on its own it
+//! can follow a gesturing hand. Builds with the default `faces` feature use
+//! [`crate::ultraface::FaceTracker`], which only falls back to this tracker
+//! when no face is in shot.
 
 use detent_core::index::{SubjectBox, SubjectSource};
 
@@ -19,6 +21,20 @@ use crate::source::RgbFrame;
 pub trait SubjectDetector: Send {
     /// Observes a frame at `t_ms`; may emit a box.
     fn observe(&mut self, frame: &RgbFrame, t_ms: u64) -> Result<Option<SubjectBox>>;
+
+    /// After the last frame: stretches `[start_ms, end_ms]` in which a face
+    /// detector looked and found no face. `None` for detectors that do not
+    /// look for faces.
+    fn faceless_ms(&mut self) -> Option<Vec<(u64, u64)>> {
+        None
+    }
+
+    /// After the last frame: stretches `[start_ms, end_ms]` in which no
+    /// visible mouth moved (no face, or every face's mouth still). `None`
+    /// for detectors that do not look at faces.
+    fn lips_still_ms(&mut self) -> Option<Vec<(u64, u64)>> {
+        None
+    }
 }
 
 /// Grid columns used for blob segmentation (rows follow the aspect ratio).
@@ -52,6 +68,12 @@ impl SaliencyTracker {
             motion: Vec::new(),
             locked: None,
         }
+    }
+
+    /// Makes the tracker prefer the blob around `(x, y)` (normalised), e.g.
+    /// the last place a face detector saw the subject.
+    pub fn lock_at(&mut self, x: f64, y: f64) {
+        self.locked = Some((x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)));
     }
 }
 

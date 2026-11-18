@@ -18,7 +18,7 @@ onnx = ["detent-indexer/onnx"]
 
 [dependencies]
 detent-core.workspace = true
-detent-indexer = { workspace = true, features = ["dsp", "ffmpeg-cli"] }
+detent-indexer = { workspace = true, features = ["dsp", "ffmpeg-cli", "faces"] }
 detent-renderer.workspace = true
 anyhow.workspace = true
 serde.workspace = true

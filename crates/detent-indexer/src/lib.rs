@@ -10,7 +10,8 @@
 //!
 //! Decoding sits behind the [`PcmSource`] / [`FrameSource`] traits. The
 //! default `ffmpeg-cli` feature implements them by streaming raw samples out
-//! of an `ffmpeg` child process; `whisper` and `onnx` add native ML backends.
+//! of an `ffmpeg` child process; `faces` (default) adds pure-Rust face
+//! detection; `whisper` and `onnx` add native ML backends.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -21,6 +22,8 @@
 
 pub mod contact;
 pub mod error;
+#[cfg(feature = "faces")]
+pub mod faces;
 #[cfg(feature = "ffmpeg-cli")]
 pub mod ffmpeg;
 pub mod freeze;
@@ -31,6 +34,7 @@ pub mod saliency;
 pub mod shots;
 pub mod source;
 pub mod transcript;
+pub mod ultraface;
 
 #[cfg(feature = "onnx")]
 pub mod onnx;

@@ -227,18 +227,14 @@ pub fn solve_segment(seg: &SegmentCamera<'_>) -> CameraPath {
     // A tiny "subject" is a facecam inset: tracking it would frame the corner
     // of the screen and discard the content, so hold the centre instead.
     let (seg_start_ms, seg_end_ms) = (t_ms(0), t_ms(n));
-    let mut widths: Vec<f32> = seg
+    let in_segment: Vec<&crate::index::SubjectBox> = seg
         .index
         .visual
         .subjects
         .iter()
         .filter(|b| (b.t_ms as f64) >= seg_start_ms && (b.t_ms as f64) < seg_end_ms)
-        .map(|b| b.w)
         .collect();
-    widths.sort_by(f32::total_cmp);
-    let subject_inset = widths
-        .get(widths.len() / 2)
-        .is_some_and(|&w| w < crate::index::PIP_MAX_WIDTH);
+    let subject_inset = crate::index::looks_like_inset(&in_segment);
 
     // Centre targets.
     let center_at = |k: usize| {
@@ -513,6 +509,29 @@ mod tests {
         assert!(end.x > start.x + 200.0, "{start:?} -> {end:?}");
         // Compressed path still has bounded error vs. a dense re-solve.
         assert!(path.keyframes.len() < 90);
+    }
+
+    #[test]
+    fn small_faces_moving_around_a_wide_shot_are_tracked() {
+        // Regression (real event interview): three people in a wide shot,
+        // faces 6-8% of the frame wide. They are not a facecam.
+        let face = |t_ms, x| SubjectBox {
+            t_ms,
+            x,
+            y: 0.28,
+            w: 0.065,
+            h: 0.18,
+            confidence: 0.99,
+            source: SubjectSource::Face,
+        };
+        let boxes: Vec<SubjectBox> = (0..30)
+            .map(|k| face(k * 200, if k < 15 { 0.25 } else { 0.8 }))
+            .collect();
+        let idx = index_with(boxes, vec![]);
+        let path = solve_segment(&seg(&idx, MotionPreset::SmoothTrackSubject, 180));
+        assert!(!path.subject_inset);
+        let refs: Vec<&SubjectBox> = idx.visual.subjects.iter().collect();
+        assert!(!crate::index::looks_like_inset(&refs));
     }
 
     #[test]

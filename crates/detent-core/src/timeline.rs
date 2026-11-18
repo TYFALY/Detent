@@ -117,8 +117,8 @@ pub struct Splice {
     pub after_segment: usize,
     /// Equal-power crossfade length (µs).
     pub crossfade_us: i64,
-    /// Audio offset relative to the picture cut (µs): `> 0` J-cut (audio
-    /// leads), `< 0` L-cut (audio lags), `0` straight cut.
+    /// Audio offset relative to the picture cut (µs on the output clock):
+    /// `> 0` J-cut (audio leads), `< 0` L-cut (audio lags), `0` straight cut.
     pub av_offset_us: i64,
     /// The next segment opens with a short white flash.
     #[serde(default)]

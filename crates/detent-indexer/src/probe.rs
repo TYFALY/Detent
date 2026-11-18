@@ -3,8 +3,8 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use detent_core::index::{AudioStreamInfo, SourceInfo, VideoStreamInfo};
-use detent_core::time::FrameRate;
+use detent_core::index::{AudioStreamInfo, FreezeInterval, SourceInfo, VideoStreamInfo};
+use detent_core::time::{FrameRate, us_to_ms};
 use serde_json::Value;
 
 use crate::error::{IndexError, Result};
@@ -182,6 +182,86 @@ fn parse_audio(s: &Value) -> Result<AudioStreamInfo> {
     })
 }
 
+/// Stretches where the video stream has no frames at all (`[start, end)` in
+/// ms from the first frame, on the `fps` grid): a lagging stream capture
+/// stores nothing while the stream stalls. Reads packet timestamps only (no
+/// decoding). See [`timestamp_gaps`] for what counts as a gap.
+pub fn frame_gaps(tools: &FfmpegTools, path: &Path, fps: FrameRate) -> Result<Vec<FreezeInterval>> {
+    let out = Command::new(&tools.ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| IndexError::ToolNotFound {
+            tool: "ffprobe",
+            path: tools.ffprobe.display().to_string(),
+            source,
+        })?;
+    if !out.status.success() {
+        return Err(IndexError::ToolFailed {
+            tool: "ffprobe",
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        });
+    }
+    let pts: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+        .collect();
+    Ok(timestamp_gaps(pts, fps, 150))
+}
+
+/// Frame-timestamp gaps of at least `min_ms` and three frame periods.
+///
+/// Files that store frames only when the picture changes (some screen
+/// recorders) have gaps whenever the screen is still; when gaps cover more
+/// than half of the file its timestamps say nothing about lag, so none are
+/// reported. (A badly lagging stream capture can lose a quarter of its
+/// frames, so the cut-off sits well above that.)
+pub fn timestamp_gaps(mut pts: Vec<f64>, fps: FrameRate, min_ms: u64) -> Vec<FreezeInterval> {
+    pts.retain(|t| t.is_finite());
+    pts.sort_by(f64::total_cmp);
+    pts.dedup();
+    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
+        return Vec::new();
+    };
+    let rate = fps.as_f64();
+    let period = 1.0 / rate;
+    let min_gap = (3.0 * period).max(min_ms as f64 / 1_000.0);
+    let mut out = Vec::new();
+    let mut covered = 0.0;
+    for w in pts.windows(2) {
+        if w[1] - w[0] < min_gap {
+            continue;
+        }
+        // The frame at w[0] is held; repeats start one frame later.
+        let a = ((w[0] - first) * rate).round() as i64 + 1;
+        let b = ((w[1] - first) * rate).round() as i64;
+        if b <= a {
+            continue;
+        }
+        covered += w[1] - w[0];
+        out.push(FreezeInterval {
+            start_ms: us_to_ms(fps.frame_to_us(a)),
+            end_ms: us_to_ms(fps.frame_to_us(b)),
+            still: false,
+        });
+    }
+    if covered > 0.5 * (last - first).max(period) {
+        return Vec::new();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +336,29 @@ mod tests {
     fn reduces_rates() {
         assert_eq!(parse_rate("50/2").unwrap(), FrameRate::new(25, 1).unwrap());
         assert!(parse_rate("0/0").is_none());
+    }
+
+    #[test]
+    fn timestamp_gaps_find_a_stall_and_ignore_change_only_captures() {
+        let fps = FrameRate::new(30, 1).unwrap();
+        // 30 fps from 5.0 s, nothing between 6.0 and 6.5 s, then 30 fps again.
+        let mut pts: Vec<f64> = (0..=30).map(|k| 5.0 + f64::from(k) / 30.0).collect();
+        pts.extend((0..60).map(|k| 6.5 + f64::from(k) / 30.0));
+        let gaps = timestamp_gaps(pts.clone(), fps, 150);
+        assert_eq!(
+            gaps,
+            vec![FreezeInterval {
+                start_ms: 1_033,
+                end_ms: 1_500,
+                still: false
+            }]
+        );
+        // A 100 ms hiccup is too short.
+        let mut short: Vec<f64> = (0..=30).map(|k| f64::from(k) / 30.0).collect();
+        short.extend((0..30).map(|k| 1.1 + f64::from(k) / 30.0));
+        assert!(timestamp_gaps(short, fps, 150).is_empty());
+        // Frames only when something changes: gaps everywhere, no lag.
+        let sparse: Vec<f64> = (0..20).map(|k| f64::from(k) * 0.5).collect();
+        assert!(timestamp_gaps(sparse, fps, 150).is_empty());
     }
 }

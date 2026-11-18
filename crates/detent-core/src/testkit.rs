@@ -182,6 +182,8 @@ pub fn synthetic_index(duration_ms: u64, seed: u32) -> MediaIndex {
             contact_sheet: None,
             freezes: Vec::new(),
             luma_per_s: Vec::new(),
+            faceless_ms: None,
+            lips_still_ms: None,
         },
     }
 }

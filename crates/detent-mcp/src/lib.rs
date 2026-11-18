@@ -54,7 +54,9 @@ clean cuts; use `video_transitions` `Flash` only for a shock moment or beat drop
 Several videos (a campaign's footage folder): index_media each file, then pass the first as \
 `index_path` and the rest as `extra_index_paths`; each clip's `source` picks its file (0 = index_path, \
 1.. = extra_index_paths in order). Files without sound play silence. Frozen-picture stretches \
-(`digest.freezes_ms`, stream lag) are cut out of clips automatically. For text with no speech behind \
+(`digest.freezes_ms`, stream lag) are cut out of clips automatically; stalls inside a still picture \
+(`digest.still_lag_ms`) are invisible and stay in. J/L cuts also work into slow-mo clips and silent files. \
+For text with no speech behind \
 it (music trailers, product footage) use `texts` (clip + offset_ms + duration_ms); `headline` and \
 `chapters` work without a transcript too. Slow-mo replay: repeat the payoff range as another clip with \
 `speed: 0.5`. Dark footage (`digest.mean_luma` < 0.3): `output.exposure: Auto`. `output.progress_bar` \
@@ -400,17 +402,22 @@ pub fn default_out_dir(media: &Path) -> PathBuf {
     media.with_file_name(name)
 }
 
-/// Subject detector + analysis frame width. With the `onnx` feature and
-/// `DETENT_FACE_MODEL` set (plus `ORT_DYLIB_PATH` for ONNX Runtime), uses the
-/// UltraFace detector on 320 px frames; otherwise the saliency heuristic on
-/// 160 px frames.
+/// Subject detector + analysis frame width (320 px, the face model's input
+/// width). By default the built-in face detector (UltraFace in pure Rust,
+/// with motion-saliency fallback when nobody is in shot). With the `onnx`
+/// feature and `DETENT_FACE_MODEL` set (plus `ORT_DYLIB_PATH`), the same
+/// model family runs through ONNX Runtime instead. `DETENT_SUBJECTS=saliency`
+/// forces the old heuristic.
 pub fn make_detector() -> anyhow::Result<(Box<dyn SubjectDetector>, u32)> {
+    if std::env::var("DETENT_SUBJECTS").is_ok_and(|v| v.eq_ignore_ascii_case("saliency")) {
+        return Ok((Box::new(SaliencyTracker::new(200)), 160));
+    }
     #[cfg(feature = "onnx")]
     if let Some(model) = std::env::var_os("DETENT_FACE_MODEL") {
         let det = detent_indexer::onnx::OnnxFaceDetector::new(Path::new(&model), 0.7, 200)?;
         return Ok((Box::new(det), 320));
     }
-    Ok((Box::new(SaliencyTracker::new(200)), 160))
+    Ok((Box::new(detent_indexer::faces::tracker(200)?), 320))
 }
 
 /// Blocking implementation of `index_media`, shared with the CLI.
