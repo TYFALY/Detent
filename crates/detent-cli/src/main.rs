@@ -29,11 +29,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Index a media file → `<out>/index.json` + `<out>/grid.jpg`.
+    /// Index media → `<file>.detent/index.json` + `grid.jpg` per file. A
+    /// folder indexes every video inside it (a campaign's footage folder).
     Index {
-        /// Media file.
-        input: PathBuf,
-        /// Output directory (default: `<input>.detent/`).
+        /// Media files and/or folders.
+        #[arg(required = true)]
+        input: Vec<PathBuf>,
+        /// Output directory (default: `<input>.detent/`; single file only).
         #[arg(short, long)]
         out: Option<PathBuf>,
         /// Word-level transcript JSON (detent or WhisperX layout).
@@ -55,10 +57,14 @@ enum Cmd {
     },
     /// Validate + solve a Semantic EDL → resolved timeline JSON.
     Solve {
-        /// `index.json` from `detent index`.
+        /// `index.json` from `detent index` (clip `source` 0).
         index: PathBuf,
         /// Semantic EDL JSON.
         edl: PathBuf,
+        /// More `index.json` files for a multi-video edit: clip `source` 1 is
+        /// the first `--source`, 2 the second, and so on.
+        #[arg(short, long = "source")]
+        sources: Vec<PathBuf>,
         /// Output timeline path (default: `timeline.json` next to the index).
         #[arg(short, long)]
         out: Option<PathBuf>,
@@ -82,6 +88,30 @@ enum Cmd {
         /// Fast preview (stream copy when no reframing/captions).
         #[arg(long)]
         preview: bool,
+        /// Keep the file under this many MB (1 MB = 1,000,000 bytes), e.g.
+        /// 9.5 for Instagram's web upload limit.
+        #[arg(long)]
+        max_size_mb: Option<f64>,
+    },
+    /// Check a clip against a campaign's rules before posting.
+    Check {
+        /// Campaign rules JSON (`detent schema campaign` prints the format).
+        rules: PathBuf,
+        /// Solved `timeline.json`.
+        #[arg(long)]
+        timeline: Option<PathBuf>,
+        /// Rendered video.
+        #[arg(long)]
+        video: Option<PathBuf>,
+        /// The exact caption that will be posted.
+        #[arg(long, conflicts_with = "caption_file")]
+        caption: Option<String>,
+        /// Read the caption from a text file.
+        #[arg(long)]
+        caption_file: Option<PathBuf>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Serve the MCP tools over stdio (for Claude Code / Claude Desktop).
     Mcp,
@@ -125,6 +155,7 @@ enum SchemaArg {
     Edl,
     Index,
     Timeline,
+    Campaign,
 }
 
 fn main() -> Result<()> {
@@ -144,30 +175,61 @@ fn main() -> Result<()> {
             whisper_cli,
             language,
             digest,
-        } => index(
-            &input,
-            out,
-            detent_mcp::AsrChoice {
-                transcript_json: transcript,
-                whisper_model,
-                whisper_cli,
-                language,
-            },
-            digest,
-        ),
+        } => {
+            let files = expand_inputs(&input)?;
+            if files.len() > 1 && (out.is_some() || transcript.is_some()) {
+                bail!("--out and --transcript need a single input file");
+            }
+            for f in &files {
+                index(
+                    f,
+                    out.clone(),
+                    detent_mcp::AsrChoice {
+                        transcript_json: transcript.clone(),
+                        whisper_model: whisper_model.clone(),
+                        whisper_cli: whisper_cli.clone(),
+                        language: language.clone(),
+                    },
+                    digest,
+                )?;
+            }
+            Ok(())
+        }
         Cmd::Solve {
             index,
             edl,
+            sources,
             out,
             report,
-        } => solve(&index, &edl, out, report),
+        } => solve(&index, &sources, &edl, out, report),
         Cmd::Render {
             timeline,
             out,
             quality,
             encoder,
             preview,
-        } => render(&timeline, &out, quality, encoder, preview),
+            max_size_mb,
+        } => render(&timeline, &out, quality, encoder, preview, max_size_mb),
+        Cmd::Check {
+            rules,
+            timeline,
+            video,
+            caption,
+            caption_file,
+            json,
+        } => {
+            let caption = match caption_file {
+                Some(p) => Some(std::fs::read_to_string(p)?.trim().to_owned()),
+                None => caption,
+            };
+            check(
+                &rules,
+                timeline.as_deref(),
+                video.as_deref(),
+                caption.as_deref(),
+                json,
+            )
+        }
         Cmd::Mcp => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -179,6 +241,9 @@ fn main() -> Result<()> {
                 SchemaArg::Edl => SemanticEdl::json_schema(),
                 SchemaArg::Index => schemars::schema_for!(MediaIndex),
                 SchemaArg::Timeline => schemars::schema_for!(ResolvedTimeline),
+                SchemaArg::Campaign => {
+                    schemars::schema_for!(detent_core::campaign::CampaignRules)
+                }
             };
             println!("{}", serde_json::to_string_pretty(&s)?);
             Ok(())
@@ -235,11 +300,55 @@ fn index(
     Ok(())
 }
 
-fn solve(index: &Path, edl: &Path, out: Option<PathBuf>, report: Option<PathBuf>) -> Result<()> {
-    let idx = MediaIndex::from_json(&std::fs::read_to_string(index)?)
-        .with_context(|| format!("reading {}", index.display()))?;
+/// Video extensions picked up when a folder is indexed.
+const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mov", "mkv", "webm", "m4v", "avi"];
+
+/// Files as given, with every folder replaced by the videos inside it
+/// (sorted by name).
+fn expand_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for p in inputs {
+        if p.is_dir() {
+            let mut v: Vec<PathBuf> = std::fs::read_dir(p)
+                .with_context(|| format!("reading {}", p.display()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|f| {
+                    f.is_file()
+                        && f.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                            VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str())
+                        })
+                })
+                .collect();
+            v.sort();
+            if v.is_empty() {
+                bail!("no video files in {}", p.display());
+            }
+            files.extend(v);
+        } else {
+            files.push(p.clone());
+        }
+    }
+    Ok(files)
+}
+
+fn read_index_file(p: &Path) -> Result<MediaIndex> {
+    MediaIndex::from_json(&std::fs::read_to_string(p)?)
+        .with_context(|| format!("reading {}", p.display()))
+}
+
+fn solve(
+    index: &Path,
+    sources: &[PathBuf],
+    edl: &Path,
+    out: Option<PathBuf>,
+    report: Option<PathBuf>,
+) -> Result<()> {
+    let mut idx = vec![read_index_file(index)?];
+    for s in sources {
+        idx.push(read_index_file(s)?);
+    }
     let edl = SemanticEdl::from_json(&std::fs::read_to_string(edl)?)?;
-    let res = match EdlSolver::default().solve(&edl, &idx) {
+    let res = match EdlSolver::default().solve_sources(&edl, &idx) {
         Ok(r) => r,
         Err(detent_core::CoreError::Validation(issues)) => {
             for i in &issues {
@@ -264,8 +373,13 @@ fn solve(index: &Path, edl: &Path, out: Option<PathBuf>, report: Option<PathBuf>
     );
     for c in &r.cuts {
         eprintln!(
-            "  clip {}: requested {}-{} ms → video {}-{} ms (frames {}-{}), at {} ms",
+            "  clip {}{}: requested {}-{} ms → video {}-{} ms (frames {}-{}), at {} ms",
             c.clip,
+            if idx.len() > 1 {
+                format!(" [source {}]", c.source)
+            } else {
+                String::new()
+            },
             c.requested_ms.0,
             c.requested_ms.1,
             c.video_ms.0,
@@ -293,6 +407,7 @@ fn render(
     quality: QualityArg,
     encoder: EncoderArg,
     preview: bool,
+    max_size_mb: Option<f64>,
 ) -> Result<()> {
     let t = ResolvedTimeline::from_json(&std::fs::read_to_string(timeline)?)?;
     let renderer = Renderer::new(Tools::default())?;
@@ -315,6 +430,7 @@ fn render(
             RenderMode::Full
         },
         batch_segments: None,
+        max_bytes: max_size_mb.map(detent_mcp::mb_to_bytes),
     };
     let mut stderr = std::io::stderr();
     let m = renderer.render(&t, out, &opts, &mut |p| {
@@ -337,5 +453,53 @@ fn render(
         m.encode_fps,
         m.realtime_factor
     );
+    if let Some(k) = m.video_kbps {
+        eprintln!("  size-capped encode at {k} kbit/s video");
+    }
+    Ok(())
+}
+
+fn check(
+    rules: &Path,
+    timeline: Option<&Path>,
+    video: Option<&Path>,
+    caption: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use detent_core::campaign::Status;
+    let r = detent_mcp::check_campaign_blocking(
+        &FfmpegTools::from_env(),
+        rules,
+        timeline,
+        video,
+        caption,
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+    } else {
+        eprintln!("campaign: {}", r.campaign);
+        for c in &r.checks {
+            let tag = match c.status {
+                Status::Pass => "  ✓",
+                Status::Fail => "  ✗",
+                Status::Skipped => "  -",
+            };
+            eprintln!("{tag} {}: {}", c.rule, c.detail);
+        }
+        for m in &r.reminders {
+            eprintln!("  ! {m}");
+        }
+        eprintln!(
+            "{}",
+            if r.ok {
+                "ready to post (do the reminders above by hand)"
+            } else {
+                "NOT ready: fix the ✗ rules first"
+            }
+        );
+    }
+    if !r.ok {
+        std::process::exit(2);
+    }
     Ok(())
 }

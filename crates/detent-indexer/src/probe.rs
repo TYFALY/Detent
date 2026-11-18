@@ -134,10 +134,23 @@ fn parse_video(s: &Value) -> Result<VideoStreamInfo> {
     if (rotation.abs() - 90.0).abs() < 1.0 || (rotation.abs() - 270.0).abs() < 1.0 {
         std::mem::swap(&mut w, &mut h);
     }
-    let fps = ["avg_frame_rate", "r_frame_rate"]
-        .iter()
-        .find_map(|k| s.get(*k).and_then(Value::as_str).and_then(parse_rate))
-        .ok_or_else(|| IndexError::Probe("video stream has no usable frame rate".into()))?;
+    let rate = |k: &str| s.get(k).and_then(Value::as_str).and_then(parse_rate);
+    // A stream capture that lagged has timestamp gaps, which pull the
+    // *average* rate below the nominal one (30 fps reads as 27.67). Use the
+    // nominal rate when it is a little above the average; a far higher one
+    // (field rate of interlaced video, 1000 fps timebases) is not a frame rate.
+    let fps = match (rate("avg_frame_rate"), rate("r_frame_rate")) {
+        (Some(avg), Some(r))
+            if r.as_f64() > avg.as_f64() * 1.005
+                && r.as_f64() <= avg.as_f64() * 1.5
+                && r.as_f64() <= 120.0 =>
+        {
+            Some(r)
+        }
+        (Some(avg), _) => Some(avg),
+        (None, r) => r,
+    }
+    .ok_or_else(|| IndexError::Probe("video stream has no usable frame rate".into()))?;
     Ok(VideoStreamInfo {
         width: w,
         height: h,
@@ -208,6 +221,26 @@ mod tests {
         });
         let v = parse_probe(&j, "x").unwrap().video.unwrap();
         assert_eq!((v.width, v.height, v.fps.num), (1080, 1920, 60));
+    }
+
+    #[test]
+    fn lagged_captures_keep_their_nominal_rate() {
+        let rate = |avg: &str, r: &str| {
+            let j = json!({
+                "streams": [{"codec_type": "video", "codec_name": "h264", "width": 1920,
+                             "height": 1080, "avg_frame_rate": avg, "r_frame_rate": r}],
+                "format": {"duration": "30"}
+            });
+            let v = parse_probe(&j, "x").unwrap().video.unwrap();
+            (v.fps.num, v.fps.den)
+        };
+        assert_eq!(rate("83/3", "30/1"), (30, 1), "gaps lower the average");
+        assert_eq!(
+            rate("30000/1001", "60000/1001"),
+            (30_000, 1_001),
+            "field rate"
+        );
+        assert_eq!(rate("25/1", "1000/1"), (25, 1), "timebase, not a rate");
     }
 
     #[test]

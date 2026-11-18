@@ -1,0 +1,20 @@
+{
+  "clips": [
+    { "source": 0, "start_ms": 1000, "end_ms": 4000, "hook_score": 0.9,
+      "editorial_note": "Product reveal from the first official clip." },
+    { "source": 1, "start_ms": 500, "end_ms": 3700, "hook_score": 0.6,
+      "editorial_note": "It in use, from the second clip." },
+    { "source": 2, "start_ms": 7200, "end_ms": 10400, "hook_score": 0.5,
+      "editorial_note": "The payoff shot from the launch ad." },
+    { "source": 2, "start_ms": 8400, "end_ms": 10000, "hook_score": 0.5, "speed": 0.5,
+      "editorial_note": "The payoff again, half speed." }
+  ],
+  "texts": [
+    { "text": "Acme just showed off\nthe Widget", "clip": 0 },
+    { "text": "it works on its own", "clip": 1, "end_clip": 2 },
+    { "text": "again, slower", "clip": 3, "position": "Center", "style": "Yellow" }
+  ],
+  "video_transitions": [ { "after_clip": 2, "kind": "Flash" } ],
+  "output": { "aspect": "Vertical9x16", "height": 1920, "layout": "Crop",
+              "exposure": "Auto", "progress_bar": true, "audio_mix": "VoiceForward" }
+}

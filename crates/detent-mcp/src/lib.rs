@@ -10,11 +10,14 @@
 //! * `solve_and_validate_edl` — run the solver; returns exact cuts and every
 //!   automatic adjustment, or JSON-pointer validation issues.
 //! * `render_timeline` — render a solved timeline; returns throughput.
+//! * `check_campaign` — test an edit, its rendered file and the post caption
+//!   against a campaign's rules before posting.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use detent_core::campaign::{CampaignReport, CampaignRules, CheckInput, VideoFacts};
 use detent_core::index::{DigestLimits, IndexDigest};
 use detent_core::{CoreError, EdlSolver, MediaIndex, ResolvedTimeline, SemanticEdl, SolveReport};
 use detent_indexer::ffmpeg::FfmpegTools;
@@ -48,7 +51,18 @@ For short-form vertical edits: open on the boldest line (no preamble), set `tigh
 a 3-5 word `headline` with `headline_duration_ms: 3000`, `captions` with 2-4 words per block, \
 `output.opening_pop`, `output.grade: MobilePop` and `output.audio_mix: VoiceForward`. Keep most splices \
 clean cuts; use `video_transitions` `Flash` only for a shock moment or beat drop.
-4. render_timeline(timeline_path, output_path) — use mode=preview first for a fast check.
+Several videos (a campaign's footage folder): index_media each file, then pass the first as \
+`index_path` and the rest as `extra_index_paths`; each clip's `source` picks its file (0 = index_path, \
+1.. = extra_index_paths in order). Files without sound play silence. Frozen-picture stretches \
+(`digest.freezes_ms`, stream lag) are cut out of clips automatically. For text with no speech behind \
+it (music trailers, product footage) use `texts` (clip + offset_ms + duration_ms); `headline` and \
+`chapters` work without a transcript too. Slow-mo replay: repeat the payoff range as another clip with \
+`speed: 0.5`. Dark footage (`digest.mean_luma` < 0.3): `output.exposure: Auto`. `output.progress_bar` \
+and `logo` are available.
+4. render_timeline(timeline_path, output_path) — use mode=preview first for a fast check; set \
+`max_size_mb` for upload limits (Instagram web: 10).
+5. check_campaign(rules_path, timeline_path, video_path, caption) before posting a paid campaign clip; \
+fix every failed rule and relay the reminders to the user.
 Never invent pixel coordinates or FFmpeg filters; the schema does not accept them.";
 
 /// Server configuration.
@@ -167,10 +181,30 @@ pub struct InspectParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SolveParams {
-    /// Path returned by `index_media`.
+    /// Path returned by `index_media` (clip `source` 0; sets the output frame rate).
     pub index_path: String,
+    /// More indexes for multi-video edits: clip `source` 1 reads the first one, 2 the second...
+    #[serde(default)]
+    pub extra_index_paths: Vec<String>,
     /// The Semantic EDL (editorial intent only).
     pub edl: SemanticEdl,
+}
+
+/// `check_campaign` parameters.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckParams {
+    /// Campaign rules JSON (see `detent schema campaign`).
+    pub rules_path: String,
+    /// Solved timeline to check (music, sound effects, footage folder, on-screen text).
+    #[serde(default)]
+    pub timeline_path: Option<String>,
+    /// Rendered video to check (duration, size, aspect).
+    #[serde(default)]
+    pub video_path: Option<String>,
+    /// The exact caption that will be posted.
+    #[serde(default)]
+    pub caption: Option<String>,
 }
 
 /// `solve_and_validate_edl` result.
@@ -199,6 +233,94 @@ pub struct RenderParams {
     /// Force an encoder (default: best working hardware encoder, else libx264).
     #[serde(default)]
     pub encoder: Option<Encoder>,
+    /// Keep the file under this many MB (1 MB = 1,000,000 bytes), e.g. 9.5 for Instagram web.
+    #[serde(default)]
+    #[schemars(range(min = 0.5, max = 4000.0))]
+    pub max_size_mb: Option<f64>,
+}
+
+/// Bytes for a `max_size_mb` value.
+pub fn mb_to_bytes(mb: f64) -> u64 {
+    (mb.max(0.0) * 1e6) as u64
+}
+
+/// Reads every index of a multi-source solve, main index first.
+pub fn read_indexes(main: &str, extra: &[String]) -> Result<Vec<MediaIndex>, String> {
+    std::iter::once(main)
+        .chain(extra.iter().map(String::as_str))
+        .map(read_index)
+        .collect()
+}
+
+/// Makes `p` absolute and canonical when it exists (for folder checks).
+fn canonical(p: &Path) -> String {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    let s = std::fs::canonicalize(&abs)
+        .unwrap_or(abs)
+        .display()
+        .to_string();
+    // Windows verbatim paths (`\\?\C:\...`) read badly in reports.
+    s.strip_prefix(r"\\?\").map_or(s.clone(), str::to_owned)
+}
+
+/// Blocking implementation of `check_campaign`, shared with the CLI. A
+/// relative `footage_dir` is resolved against the rules file's folder.
+pub fn check_campaign_blocking(
+    tools: &FfmpegTools,
+    rules_path: &Path,
+    timeline: Option<&Path>,
+    video: Option<&Path>,
+    caption: Option<&str>,
+) -> anyhow::Result<CampaignReport> {
+    let mut rules = CampaignRules::from_json(&std::fs::read_to_string(rules_path)?)?;
+    if let Some(dir) = rules.video.footage_dir.clone() {
+        let d = Path::new(&dir);
+        let d = if d.is_absolute() {
+            d.to_path_buf()
+        } else {
+            rules_path.parent().unwrap_or(Path::new(".")).join(d)
+        };
+        rules.video.footage_dir = Some(canonical(&d));
+    }
+    let mut tl = match timeline {
+        Some(p) => Some(ResolvedTimeline::from_json(&std::fs::read_to_string(p)?)?),
+        None => None,
+    };
+    if let Some(t) = tl.as_mut() {
+        t.source.path = canonical(Path::new(&t.source.path));
+        for s in &mut t.extra_sources {
+            s.path = canonical(Path::new(&s.path));
+        }
+        for i in &mut t.inserts {
+            i.path = canonical(Path::new(&i.path));
+        }
+    }
+    let facts = match video {
+        Some(p) => {
+            let info = detent_indexer::probe::probe(tools, p)?;
+            let v = info.video.as_ref();
+            Some(VideoFacts {
+                path: p.display().to_string(),
+                bytes: std::fs::metadata(p)?.len(),
+                duration_ms: info.duration_ms,
+                width: v.map_or(0, |v| v.width),
+                height: v.map_or(0, |v| v.height),
+            })
+        }
+        None => None,
+    };
+    Ok(detent_core::campaign::check(
+        &rules,
+        &CheckInput {
+            timeline: tl.as_ref(),
+            video: facts.as_ref(),
+            caption,
+        },
+    ))
 }
 
 fn tool_error(msg: impl Into<String>) -> CallToolResult {
@@ -443,8 +565,8 @@ On invalid input returns ALL issues as JSON pointers."
         Parameters(p): Parameters<SolveParams>,
     ) -> CallToolResult {
         let res = tokio::task::spawn_blocking(move || -> Result<SolveResult, CallToolResult> {
-            let idx = read_index(&p.index_path).map_err(tool_error)?;
-            match EdlSolver::default().solve(&p.edl, &idx) {
+            let idx = read_indexes(&p.index_path, &p.extra_index_paths).map_err(tool_error)?;
+            match EdlSolver::default().solve_sources(&p.edl, &idx) {
                 Ok(r) => {
                     let path = Path::new(&p.index_path).with_file_name("timeline.json");
                     let json =
@@ -502,6 +624,7 @@ reframing or captions are needed. Returns throughput metrics."
                 encoder: p.encoder.map_or(EncoderChoice::Auto, EncoderChoice::Force),
                 mode: p.mode,
                 batch_segments: None,
+                max_bytes: p.max_size_mb.map(mb_to_bytes),
             };
             Ok(renderer.render(&t, Path::new(&p.output_path), &opts, &mut |_| {})?)
         })
@@ -510,6 +633,33 @@ reframing or captions are needed. Returns throughput metrics."
             Ok(Ok(m)) => CallToolResult::success(vec![json_block(&m)]),
             Ok(Err(e)) => tool_error(format!("render_timeline failed: {e:#}")),
             Err(e) => tool_error(format!("render worker failed: {e}")),
+        }
+    }
+
+    #[tool(
+        name = "check_campaign",
+        description = "Check a clip against a paid campaign's rules before posting: exact approved \
+caption lines, required phrases, allowed hashtags/mentions, links, forbidden words (caption and \
+on-screen text), duration, 9:16, file size, no music / no sound effects, official footage folder, \
+hook text in the first seconds. Returns pass/fail/skipped per rule plus the manual reminders \
+(paid-partnership label, submission window)."
+    )]
+    async fn check_campaign(&self, Parameters(p): Parameters<CheckParams>) -> CallToolResult {
+        let state = self.state.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            check_campaign_blocking(
+                &state.ffmpeg,
+                Path::new(&p.rules_path),
+                p.timeline_path.as_deref().map(Path::new),
+                p.video_path.as_deref().map(Path::new),
+                p.caption.as_deref(),
+            )
+        })
+        .await;
+        match res {
+            Ok(Ok(r)) => CallToolResult::success(vec![json_block(&r)]),
+            Ok(Err(e)) => tool_error(format!("check_campaign failed: {e:#}")),
+            Err(e) => tool_error(format!("check worker failed: {e}")),
         }
     }
 }
@@ -545,6 +695,7 @@ mod tests {
             "inspect_keyframes",
             "solve_and_validate_edl",
             "render_timeline",
+            "check_campaign",
         ] {
             assert!(names.contains(&n.to_owned()), "missing {n}: {names:?}");
         }

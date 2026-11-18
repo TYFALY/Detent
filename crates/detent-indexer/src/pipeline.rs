@@ -14,6 +14,7 @@ use detent_core::time::us_to_ms;
 
 use crate::contact::{ContactSheetBuilder, GridSpec};
 use crate::error::{IndexError, Result};
+use crate::freeze::{FreezeConfig, FreezeDetector};
 use crate::saliency::SubjectDetector;
 use crate::shots::{ShotConfig, ShotDetector};
 use crate::source::{FrameSource, PcmSource, RgbFrame};
@@ -31,6 +32,8 @@ pub struct IndexOptions {
     pub pauses: PauseConfig,
     /// Shot detection.
     pub shots: ShotConfig,
+    /// Frozen-picture detection.
+    pub freezes: FreezeConfig,
     /// Width of analysis frames (height follows the aspect ratio).
     pub analysis_width: u32,
     /// Contact sheet grid `(columns, rows)`, written to `contact_sheet_path`.
@@ -47,6 +50,7 @@ impl Default for IndexOptions {
             dsp: DspConfig::default(),
             pauses: PauseConfig::default(),
             shots: ShotConfig::default(),
+            freezes: FreezeConfig::default(),
             analysis_width: 160,
             contact_grid: Some((4, 4)),
             contact_sheet_path: None,
@@ -94,6 +98,8 @@ struct AudioOut {
 }
 
 struct VideoOut {
+    freezes: Vec<detent_core::index::FreezeInterval>,
+    luma_per_s: Vec<f32>,
     shots: Vec<ShotBoundary>,
     subjects: Vec<SubjectBox>,
     sheet: Option<ContactSheet>,
@@ -158,6 +164,7 @@ where
             };
             let (w, h) = (src.width(), src.height());
             let mut shots = ShotDetector::new(opts.shots);
+            let mut freezes = FreezeDetector::new(opts.freezes);
             let mut sheet = match (opts.contact_grid, &opts.contact_sheet_path) {
                 (Some((columns, rows)), Some(_)) => Some(ContactSheetBuilder::new(
                     GridSpec {
@@ -177,6 +184,7 @@ where
             while src.next_frame(&mut frame)? {
                 let t_ms = us_to_ms(fps.frame_to_us(k as i64));
                 shots.push(&frame);
+                freezes.push(&frame, t_ms);
                 if let Some(b) = detector.observe(&frame, t_ms)? {
                     subjects.push(b);
                 }
@@ -190,7 +198,10 @@ where
                 (Some(b), Some(p)) => Some(b.finish(p)?),
                 _ => None,
             };
+            let (freezes, luma_per_s) = freezes.finish(fps);
             Ok(Some(VideoOut {
+                freezes,
+                luma_per_s,
                 shots: shots.finish(fps),
                 subjects,
                 sheet,
@@ -216,6 +227,8 @@ where
                 shots: v.shots,
                 subjects: v.subjects,
                 contact_sheet: v.sheet,
+                freezes: v.freezes,
+                luma_per_s: v.luma_per_s,
             },
             v.frames,
         ),
@@ -280,13 +293,17 @@ mod file {
         let frames = match &source.video {
             Some(v) => {
                 let (w, h) = analysis_dims(opts.analysis_width, v.width, v.height);
+                // Resample to the nominal rate: variable-frame-rate files
+                // (stream captures) leave timestamp gaps when the stream
+                // lags; filling them with repeats keeps frame k at k/fps and
+                // makes the lag visible to the freeze detector.
                 Some(FfmpegFrames::spawn(
                     tools,
                     path,
                     w,
                     h,
                     DecodeRange::default(),
-                    None,
+                    Some(v.fps.as_f64()),
                 )?)
             }
             None => None,

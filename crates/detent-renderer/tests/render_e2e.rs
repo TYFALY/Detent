@@ -108,12 +108,16 @@ fn edl() -> SemanticEdl {
     SemanticEdl {
         clips: vec![
             EdlClip {
+                source: 0,
+                speed: None,
                 start_ms: 6_150,
                 end_ms: 8_000,
                 hook_score: 0.9,
                 editorial_note: "hook".into(),
             },
             EdlClip {
+                source: 0,
+                speed: None,
                 start_ms: 250,
                 end_ms: 3_450,
                 hook_score: 0.5,
@@ -143,6 +147,9 @@ fn edl() -> SemanticEdl {
         word_colors: Vec::new(),
         chapters: Vec::new(),
         inserts: Vec::new(),
+        texts: Vec::new(),
+        drop_freezes: true,
+        logo: None,
         sound: None,
         headline_duration_ms: None,
         video_transitions: Vec::new(),
@@ -175,6 +182,7 @@ fn full_render_is_frame_exact() {
                 encoder: EncoderChoice::Force(Encoder::Libx264),
                 mode: RenderMode::Full,
                 batch_segments: None,
+                max_bytes: None,
             },
             &mut |_| updates += 1,
         )
@@ -236,6 +244,7 @@ fn finishing_effects_keep_frames_and_sync() {
                     encoder: EncoderChoice::Force(Encoder::Libx264),
                     mode: RenderMode::Full,
                     batch_segments: None,
+                    max_bytes: None,
                 },
                 &mut |_| {},
             )
@@ -328,6 +337,8 @@ fn batched_render_matches_single_pass() {
     e.clips = [(6_150, 8_000), (250, 1_500), (1_700, 3_450), (4_000, 5_500)]
         .into_iter()
         .map(|(start_ms, end_ms)| EdlClip {
+            source: 0,
+            speed: None,
             start_ms,
             end_ms,
             hook_score: 0.5,
@@ -358,6 +369,7 @@ fn batched_render_matches_single_pass() {
                     encoder: EncoderChoice::Force(Encoder::Libx264),
                     mode: RenderMode::Full,
                     batch_segments: batch,
+                    max_bytes: None,
                 },
                 &mut |_| {},
             )
@@ -386,4 +398,174 @@ fn batched_render_matches_single_pass() {
         durations.windows(2).all(|w| (w[0] - w[1]).abs() < 0.03),
         "{durations:?}"
     );
+}
+
+/// A silent 25 fps vertical source whose timestamps jump by 1 s at 2 s (a
+/// lagging stream capture), plus a small logo image.
+fn second_source(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let tools = FfmpegTools::from_env();
+    let clip = dir.join("lagged.mp4");
+    let ok = Command::new(&tools.ffmpeg)
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc2=s=360x640:r=25:d=6,setpts='if(gte(T,2),PTS+1/TB,PTS)'")
+        .args([
+            "-fps_mode",
+            "vfr",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .args(["-pix_fmt", "yuv420p", "-an"])
+        .arg(&clip)
+        .status()
+        .ok()?
+        .success();
+    let logo = dir.join("logo.png");
+    let ok2 = Command::new(&tools.ffmpeg)
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("color=c=red:s=200x80")
+        .args(["-frames:v", "1"])
+        .arg(&logo)
+        .status()
+        .ok()?
+        .success();
+    (ok && ok2).then_some((clip, logo))
+}
+
+#[test]
+fn multi_source_edit_with_speed_text_logo_and_size_cap() {
+    use detent_core::edl::{Exposure, Logo, LogoPlacement, TextOverlay, TextPosition, TextStyle};
+    use detent_indexer::NoTranscript;
+
+    let dir = tempfile::tempdir().unwrap();
+    let Some(src) = fixture(dir.path()) else {
+        return;
+    };
+    let Some((lagged, logo)) = second_source(dir.path()) else {
+        return;
+    };
+    let tools = FfmpegTools::from_env();
+    let opts = IndexOptions::default();
+    let a = index_file(
+        &tools,
+        &src,
+        &mut NoTranscript,
+        &mut SaliencyTracker::new(200),
+        &opts,
+    )
+    .unwrap()
+    .index;
+    let b = index_file(
+        &tools,
+        &lagged,
+        &mut NoTranscript,
+        &mut SaliencyTracker::new(200),
+        &opts,
+    )
+    .unwrap()
+    .index;
+    assert!(b.source.audio.is_none());
+    // The 1 s timestamp gap is decoded as repeated frames and found.
+    assert!(
+        b.visual
+            .freezes
+            .iter()
+            .any(|f| f.start_ms.abs_diff(2_000) < 100 && f.end_ms.abs_diff(3_000) < 100),
+        "{:?}",
+        b.visual.freezes
+    );
+    let clip = |source, start_ms, end_ms, speed| EdlClip {
+        source,
+        start_ms,
+        end_ms,
+        hook_score: 0.5,
+        editorial_note: String::new(),
+        speed,
+    };
+    let mut e = edl();
+    e.clips = vec![
+        clip(0, 250, 3_450, None),
+        clip(1, 1_000, 5_000, None),
+        clip(0, 6_150, 8_000, Some(0.5)),
+    ];
+    e.motion_cues.clear();
+    e.audio_transitions.clear();
+    e.captions = None;
+    e.texts = vec![TextOverlay {
+        text: "two files,\none edit".into(),
+        clip: 1,
+        offset_ms: 200,
+        duration_ms: None,
+        end_clip: None,
+        position: TextPosition::Upper,
+        style: TextStyle::Bold,
+    }];
+    e.logo = Some(Logo {
+        path: logo.display().to_string(),
+        placement: LogoPlacement::TopRight,
+        width_pct: Some(20),
+    });
+    e.output.progress_bar = true;
+    e.output.exposure = Exposure::Lift;
+    let res = EdlSolver::default()
+        .solve_sources(&e, &[a, b])
+        .expect("multi-source solve");
+    let t = res.timeline;
+    // Clip 1 is split around the freeze; the replay runs at half speed.
+    assert_eq!(t.segments.len(), 4, "{:?}", res.report);
+    assert_eq!(t.segments.iter().filter(|s| s.source == 1).count(), 2);
+    assert_eq!(t.segments[3].speed, 0.5);
+    assert!(t.segments.iter().all(|s| s.gamma > 1.0));
+    assert_eq!(t.extra_sources.len(), 1);
+    assert!(!copy_eligible(&t));
+
+    let renderer = Renderer::new(Tools::default()).unwrap();
+    let out = dir.path().join("multi.mp4");
+    let max = 450_000;
+    let m = renderer
+        .render(
+            &t,
+            &out,
+            &RenderOptions {
+                quality: Quality::Draft,
+                encoder: EncoderChoice::Force(Encoder::Libx264),
+                mode: RenderMode::Full,
+                batch_segments: None,
+                max_bytes: Some(max),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    assert!(m.video_kbps.is_some());
+    assert!(m.output_bytes <= max, "{} > {max}", m.output_bytes);
+    let p = probe(&out);
+    let v = stream(&p, "video");
+    let got: i64 = v["nb_read_frames"].as_str().unwrap().parse().unwrap();
+    assert_eq!(got, t.total_output_frames());
+    let a = stream(&p, "audio");
+    let a_dur: f64 = a["duration"].as_str().unwrap().parse().unwrap();
+    let v_dur = t.duration_us as f64 / 1e6;
+    assert!(
+        (a_dur - v_dur).abs() < 0.06,
+        "audio {a_dur}s vs video {v_dur}s"
+    );
+
+    // The same edit in batches of one segment joins to the same frame count.
+    let out2 = dir.path().join("multi_batched.mp4");
+    let m2 = renderer
+        .render(
+            &t,
+            &out2,
+            &RenderOptions {
+                quality: Quality::Draft,
+                encoder: EncoderChoice::Force(Encoder::Libx264),
+                mode: RenderMode::Full,
+                batch_segments: Some(1),
+                max_bytes: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(m2.frames as i64, t.total_output_frames());
 }

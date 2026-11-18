@@ -77,6 +77,8 @@ fn index(words: &[(&str, u64, u64)], duration_ms: u64, fps: FrameRate) -> MediaI
 
 fn clip(start_ms: u64, end_ms: u64) -> EdlClip {
     EdlClip {
+        source: 0,
+        speed: None,
         start_ms,
         end_ms,
         hook_score: 0.5,
@@ -95,6 +97,9 @@ fn edl(clips: Vec<EdlClip>) -> SemanticEdl {
         word_colors: Vec::new(),
         chapters: Vec::new(),
         inserts: Vec::new(),
+        texts: Vec::new(),
+        drop_freezes: true,
+        logo: None,
         sound: None,
         headline_duration_ms: None,
         video_transitions: Vec::new(),
@@ -303,8 +308,9 @@ fn chapters_and_inserts_are_validated() {
         panic!("expected validation errors");
     };
     let paths: Vec<&str> = issues.iter().map(|i| i.path.as_str()).collect();
+    // Chapters no longer need captions (they render without a transcript).
+    assert!(!paths.contains(&"/chapters/0"), "{paths:?}");
     for p in [
-        "/chapters/0",
         "/chapters/1/clip",
         "/chapters/1/text",
         "/inserts/0/clip",
@@ -876,6 +882,8 @@ fn arb_scenario() -> impl Strategy<Value = Scenario> {
                     let clips: Vec<EdlClip> = clips
                         .into_iter()
                         .map(|(s, len, hook)| EdlClip {
+                            source: 0,
+                            speed: None,
                             start_ms: s,
                             end_ms: (s + len).min(dur),
                             hook_score: hook,
@@ -920,6 +928,9 @@ fn arb_scenario() -> impl Strategy<Value = Scenario> {
                             word_colors: Vec::new(),
                             chapters: Vec::new(),
                             inserts: Vec::new(),
+                            texts: Vec::new(),
+                            drop_freezes: true,
+                            logo: None,
                             sound: None,
                             headline_duration_ms: None,
                             video_transitions: Vec::new(),
@@ -1003,5 +1014,218 @@ proptest! {
             prop_assert_eq!(a.timeline, b.timeline);
             prop_assert_eq!(a.report, b.report);
         }
+    }
+}
+
+/// A silent 24 fps vertical clip with a frozen stretch at 2.0-2.6 s.
+fn silent_lagged() -> MediaIndex {
+    let mut idx = index(&[], 6_000, FrameRate::new(24, 1).unwrap());
+    idx.source.path = "/media/broll.mp4".into();
+    idx.source.audio = None;
+    idx.audio = AudioTelemetry::default();
+    if let Some(v) = idx.source.video.as_mut() {
+        (v.width, v.height) = (1080, 1920);
+    }
+    idx.visual.freezes = vec![detent_core::index::FreezeInterval {
+        start_ms: 2_000,
+        end_ms: 2_600,
+    }];
+    idx.visual.luma_per_s = vec![0.12; 6];
+    idx
+}
+
+fn on(source: usize, start_ms: u64, end_ms: u64) -> EdlClip {
+    EdlClip {
+        source,
+        ..clip(start_ms, end_ms)
+    }
+}
+
+#[test]
+fn clips_from_several_sources_keep_av_locked() {
+    let (a, b) = (talk(), silent_lagged());
+    let mut e = edl(vec![
+        on(0, 900, 2_300),
+        on(1, 500, 4_000),
+        on(0, 2_900, 4_700),
+    ]);
+    e.captions = Some(CaptionSpec::default());
+    e.output.exposure = detent_core::edl::Exposure::Auto;
+    let r = EdlSolver::default().solve_sources(&e, &[a, b]).unwrap();
+    let t = &r.timeline;
+    assert!(t.verify().is_empty(), "{:?}", t.verify());
+    // The freeze inside clip 1 is cut out: four segments, two from source 1.
+    let sources: Vec<usize> = t.segments.iter().map(|s| s.source).collect();
+    assert_eq!(sources, [0, 1, 1, 0]);
+    assert!(
+        r.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "freezes_removed")
+    );
+    assert!(
+        r.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "silent_source")
+    );
+    // Source 1 is framed in its own pixels; the output keeps source 0's rate.
+    assert_eq!(t.extra_sources[0].width, 1080);
+    assert_eq!(t.output.fps, fps30());
+    let s1 = &t.segments[1];
+    assert!(
+        s1.camera
+            .keyframes
+            .iter()
+            .all(|k| k.w <= 1080.0 && k.h <= 1920.0)
+    );
+    // Only the dark source is lifted.
+    assert_eq!(t.segments[0].gamma, 1.0);
+    assert!(s1.gamma > 1.2);
+    // Neither piece contains frozen frames.
+    for s in &t.segments[1..3] {
+        let (a, b) = (s.video.start_us / 1_000, s.video.end_us / 1_000);
+        assert!(b <= 2_000 || a >= 2_600, "{a}-{b} overlaps the freeze");
+    }
+    // Captions come from source 0 only and stay in their segments.
+    let c = t.captions.as_ref().unwrap();
+    assert!(
+        c.blocks
+            .iter()
+            .any(|b| b.words.iter().any(|w| w.text == "Hello"))
+    );
+    assert!(c.blocks.iter().all(|b| b.end_us <= t.duration_us));
+    // Every output frame is accounted for.
+    let frames: i64 = (0..t.segments.len()).map(|i| t.output_frames(i)).sum();
+    assert_eq!(frames, fps30().nearest_frame(t.duration_us));
+}
+
+#[test]
+fn keeping_freezes_warns_instead() {
+    let (a, b) = (talk(), silent_lagged());
+    let mut e = edl(vec![on(1, 500, 4_000)]);
+    e.drop_freezes = false;
+    let r = EdlSolver::default().solve_sources(&e, &[a, b]).unwrap();
+    assert_eq!(r.timeline.segments.len(), 1);
+    assert!(
+        r.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "frozen_picture")
+    );
+}
+
+#[test]
+fn slow_motion_replay_doubles_the_output_length() {
+    let idx = talk();
+    let mut e = edl(vec![clip(2_900, 4_700), clip(3_000, 4_600)]);
+    e.clips[1].speed = Some(0.5);
+    e.captions = Some(CaptionSpec::default());
+    let r = EdlSolver::default().solve(&e, &idx).unwrap();
+    let t = &r.timeline;
+    assert!(t.verify().is_empty(), "{:?}", t.verify());
+    let s = &t.segments[1];
+    assert_eq!(s.speed, 0.5);
+    assert!((s.output_len_us() - 2 * s.video.len_us()).abs() <= 1);
+    assert_eq!(
+        t.duration_us,
+        t.segments[0].output_len_us() + s.output_len_us()
+    );
+    // A replay at another speed is deliberate, not a duplicate.
+    assert!(
+        !r.report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "duplicate_source")
+    );
+    // Replayed words are stretched onto the slow segment.
+    let c = t.captions.as_ref().unwrap();
+    let last = c.blocks.last().unwrap();
+    assert!(last.end_us > s.output_start_us + s.output_len_us() / 2);
+}
+
+#[test]
+fn texts_headline_and_chapters_need_no_transcript() {
+    use detent_core::edl::{TextOverlay, TextPosition, TextStyle};
+    let idx = silent_lagged();
+    let mut e = edl(vec![clip(0, 1_500), clip(3_000, 5_000)]);
+    e.headline = Some("No speech here".into());
+    e.chapters = vec![Chapter {
+        clip: 1,
+        text: "Part two".into(),
+    }];
+    e.texts = vec![
+        TextOverlay {
+            text: "first line".into(),
+            clip: 0,
+            offset_ms: 300,
+            duration_ms: None,
+            end_clip: Some(1),
+            position: TextPosition::Upper,
+            style: TextStyle::Bold,
+        },
+        TextOverlay {
+            text: "second".into(),
+            clip: 1,
+            offset_ms: 0,
+            duration_ms: Some(800),
+            end_clip: None,
+            position: TextPosition::Center,
+            style: TextStyle::Boxed,
+        },
+    ];
+    let r = EdlSolver::default().solve(&e, &idx).unwrap();
+    let t = &r.timeline;
+    assert_eq!(t.texts.len(), 2);
+    assert_eq!(t.texts[0].start_us, 300_000);
+    assert_eq!(
+        t.texts[0].end_us, t.duration_us,
+        "runs to the end of clip 1"
+    );
+    assert_eq!(t.texts[1].start_us, t.segments[1].output_start_us);
+    assert_eq!(t.texts[1].end_us - t.texts[1].start_us, 800_000);
+    let c = t
+        .captions
+        .as_ref()
+        .expect("headline overlay without captions");
+    assert!(c.blocks.is_empty());
+    assert_eq!(c.headline.as_deref(), Some("No speech here"));
+    assert_eq!(c.chapters.len(), 1);
+}
+
+#[test]
+fn bad_sources_speeds_and_texts_are_reported() {
+    use detent_core::edl::{Logo, LogoPlacement, TextOverlay, TextPosition, TextStyle};
+    let mut e = edl(vec![on(3, 0, 1_000), clip(0, 1_000)]);
+    e.clips[1].speed = Some(8.0);
+    e.texts = vec![TextOverlay {
+        text: " ".into(),
+        clip: 0,
+        offset_ms: 0,
+        duration_ms: Some(100),
+        end_clip: Some(0),
+        position: TextPosition::Upper,
+        style: TextStyle::Bold,
+    }];
+    e.logo = Some(Logo {
+        path: "logo.mp4".into(),
+        placement: LogoPlacement::TopCenter,
+        width_pct: Some(90),
+    });
+    let Err(CoreError::Validation(issues)) = EdlSolver::default().solve_sources(&e, &[talk()])
+    else {
+        panic!("expected validation errors");
+    };
+    let paths: Vec<&str> = issues.iter().map(|i| i.path.as_str()).collect();
+    for p in [
+        "/clips/0/source",
+        "/clips/1/speed",
+        "/texts/0/text",
+        "/texts/0/duration_ms",
+        "/texts/0/end_clip",
+        "/logo/path",
+        "/logo/width_pct",
+    ] {
+        assert!(paths.contains(&p), "missing {p}: {paths:?}");
     }
 }

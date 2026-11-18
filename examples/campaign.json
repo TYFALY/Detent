@@ -1,0 +1,28 @@
+{
+  "name": "Acme Widget launch (example)",
+  "caption": {
+    "exact_one_of": [
+      "first look at the Acme Widget @acme #ad",
+      "Acme just showed off the Widget @acme #ad"
+    ],
+    "allowed_hashtags": ["#ad"],
+    "allowed_mentions": ["@acme"],
+    "no_links": true
+  },
+  "video": {
+    "min_seconds": 8,
+    "max_seconds": 90,
+    "vertical": true,
+    "max_size_mb": 10,
+    "no_music": true,
+    "no_sound_effects": true,
+    "footage_dir": "footage",
+    "hook_text_within_s": 2
+  },
+  "forbid_words": ["price", "$", "release date"],
+  "reminders": [
+    "Turn on the platform's paid-partnership label",
+    "Submit the post within 30 minutes of it going live",
+    "Keep the post live for 30 days with likes visible"
+  ]
+}

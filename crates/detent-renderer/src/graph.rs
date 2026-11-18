@@ -9,7 +9,7 @@
 
 use detent_core::ResolvedTimeline;
 use detent_core::camera::CameraPath;
-use detent_core::edl::{AudioMix, ColorGrade, InsertPlacement, is_video_insert};
+use detent_core::edl::{AudioMix, ColorGrade, InsertPlacement, LogoPlacement, is_video_insert};
 use detent_core::timeline::SfxKind;
 use std::ops::Range;
 
@@ -21,10 +21,23 @@ use crate::expr::Hinges;
 /// One `-i` input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputSpec {
+    /// Which timeline source to read (0 = `source`, k = `extra_sources[k-1]`).
+    pub source: usize,
     /// Seek position (s), placed before `-i` (fast + accurate).
     pub seek_s: f64,
     /// Read duration (s).
     pub duration_s: f64,
+}
+
+/// `atempo` chain for `speed` (each stage must stay within 0.5..=2).
+pub fn atempo(speed: f64) -> String {
+    if speed < 0.5 {
+        format!("atempo=0.5,atempo={:.6}", speed / 0.5)
+    } else if speed > 2.0 {
+        format!("atempo=2,atempo={:.6}", speed / 2.0)
+    } else {
+        format!("atempo={speed:.6}")
+    }
 }
 
 /// Inputs and filtergraph for one render.
@@ -178,7 +191,7 @@ pub fn compile(t: &ResolvedTimeline, encoder: Encoder, ass_file: Option<&str>) -
     CompiledGraph {
         inputs,
         filter: stmts.join(";\n"),
-        has_audio: t.source.has_audio,
+        has_audio: t.has_audio(),
         extra,
     }
 }
@@ -190,13 +203,13 @@ pub fn compile_batch(t: &ResolvedTimeline, range: Range<usize>) -> CompiledGraph
     let mut stmts = Vec::new();
     segments(t, range, &mut inputs, &mut stmts);
     stmts.push("[vcat]null[vout]".to_owned());
-    if t.source.has_audio {
+    if t.has_audio() {
         stmts.push("[achain]anull[aout]".to_owned());
     }
     CompiledGraph {
         inputs,
         filter: stmts.join(";\n"),
-        has_audio: t.source.has_audio,
+        has_audio: t.has_audio(),
         extra: Vec::new(),
     }
 }
@@ -214,7 +227,7 @@ pub fn compile_join(
     let mut stmts = Vec::new();
     let pads: String = (0..k).map(|i| format!("[{i}:v:0]")).collect();
     stmts.push(format!("{pads}concat=n={k}:v=1:a=0[vcat]"));
-    if t.source.has_audio {
+    if t.has_audio() {
         let labels: Vec<String> = (0..k).map(|i| format!("{i}:a:0")).collect();
         let splices: Vec<&Splice> = ranges[..k.saturating_sub(1)]
             .iter()
@@ -226,7 +239,7 @@ pub fn compile_join(
     CompiledGraph {
         inputs: Vec::new(),
         filter: stmts.join(";\n"),
-        has_audio: t.source.has_audio,
+        has_audio: t.has_audio(),
         extra,
     }
 }
@@ -244,33 +257,66 @@ fn segments(
     inputs: &mut Vec<InputSpec>,
     stmts: &mut Vec<String>,
 ) {
-    let src = (t.source.width, t.source.height);
     let raster = (t.output.width, t.output.height);
     // The camera fills the picture area: the whole raster, or the FitBlur foreground.
     let out = t.output.picture_size();
     let fit_blur = matches!(t.output.layout, Layout::FitBlur { .. });
-    let fps = t.source.fps;
-    let frame_s = fps.frame_duration_us() as f64 / 1e6;
+    let out_fps = t.output.fps;
+    let has_audio = t.has_audio();
+    // Several sources (or silent ones) may differ in channel layout: bring
+    // every segment to one format before the crossfades.
+    let mixed = !t.extra_sources.is_empty() || !t.source.has_audio;
     let mut vlabels = Vec::new();
     let mut alabels = Vec::new();
 
     for i in range.clone() {
         let seg = &t.segments[i];
+        let source = t.source_of(seg);
+        let src = (source.width, source.height);
+        let frame_s = source.fps.frame_duration_us() as f64 / 1e6;
         // Seek half a frame early so the first wanted frame is never dropped
         // by µs rounding; `trim=end_frame` then fixes the exact count.
         let v_in = inputs.len();
         let seek = (seg.video.start_us as f64 / 1e6 - frame_s / 2.0).max(0.0);
         inputs.push(InputSpec {
+            source: seg.source,
             seek_s: seek,
             duration_s: seg.video.len_us() as f64 / 1e6 + 3.0 * frame_s,
         });
         let cam = camera_filter(&seg.camera, src, out)
             .map(|c| format!(",{c}"))
             .unwrap_or_default();
+        let gamma = if seg.gamma == 1.0 {
+            String::new()
+        } else {
+            format!(",eq=gamma={:.3}", seg.gamma)
+        };
+        // `fps` first: a variable-frame-rate source (stream capture) skips
+        // timestamps when it lagged; constant-rate frames keep the frame
+        // count (and so A/V sync) exact. A no-op on constant-rate files.
         let head = format!(
-            "[{v_in}:v:0]tpad=stop_mode=clone:stop=3,trim=end_frame={frames},setpts=PTS-STARTPTS",
+            "[{v_in}:v:0]fps={}/{},tpad=stop_mode=clone:stop=3,trim=end_frame={frames},setpts=PTS-STARTPTS{gamma}",
+            source.fps.num,
+            source.fps.den,
             frames = seg.video.frames(),
         );
+        // Speed change and/or another frame rate: retime on the output
+        // clock, then fix the exact output frame count.
+        let conv = if seg.speed == 1.0 && source.fps == out_fps {
+            String::new()
+        } else {
+            let retime = if seg.speed == 1.0 {
+                String::new()
+            } else {
+                format!(",setpts=(PTS-STARTPTS)/{:.6}", seg.speed)
+            };
+            format!(
+                "{retime},fps={}/{},tpad=stop_mode=clone:stop=4,trim=end_frame={},setpts=PTS-STARTPTS",
+                out_fps.num,
+                out_fps.den,
+                t.output_frames(i)
+            )
+        };
         let post = segment_post(t, i);
         if fit_blur {
             // Blurred, darkened cover fill computed at quarter resolution
@@ -286,22 +332,44 @@ fn segments(
             ));
             stmts.push(format!("[f{i}]{cam},setsar=1[p{i}]"));
             stmts.push(format!(
-                "[g{i}][p{i}]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1{post},setsar=1[v{i}]"
+                "[g{i}][p{i}]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1{conv}{post},setsar=1[v{i}]"
             ));
         } else {
-            stmts.push(format!("{head}{cam}{post},setsar=1[v{i}]"));
+            stmts.push(format!("{head}{cam}{conv}{post},setsar=1[v{i}]"));
         }
         vlabels.push(format!("v{i}"));
-        if t.source.has_audio {
-            let a_in = inputs.len();
-            let len = seg.audio.len_us() as f64 / 1e6;
-            inputs.push(InputSpec {
-                seek_s: seg.audio.start_us as f64 / 1e6,
-                duration_s: len + 0.1,
-            });
-            stmts.push(format!(
-                "[{a_in}:a:0]aresample=48000,atrim=duration={len:.6},apad=whole_dur={len:.6},asetpts=PTS-STARTPTS[a{i}]"
-            ));
+        if has_audio {
+            let olen = seg.audio_output_len_us() as f64 / 1e6;
+            let fmt = if mixed {
+                ",aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+            } else {
+                ""
+            };
+            if source.has_audio {
+                let a_in = inputs.len();
+                let len = seg.audio.len_us() as f64 / 1e6;
+                inputs.push(InputSpec {
+                    source: seg.source,
+                    seek_s: seg.audio.start_us as f64 / 1e6,
+                    duration_s: len + 0.1,
+                });
+                let tempo = if seg.speed == 1.0 {
+                    String::new()
+                } else {
+                    format!(
+                        ",{},atrim=duration={olen:.6},apad=whole_dur={olen:.6}",
+                        atempo(seg.speed)
+                    )
+                };
+                stmts.push(format!(
+                    "[{a_in}:a:0]aresample=48000,atrim=duration={len:.6},apad=whole_dur={len:.6},asetpts=PTS-STARTPTS{tempo}{fmt}[a{i}]"
+                ));
+            } else {
+                // A file with no sound track contributes exact-length silence.
+                stmts.push(format!(
+                    "anullsrc=r=48000:cl=stereo,atrim=duration={olen:.6},asetpts=PTS-STARTPTS{fmt}[a{i}]"
+                ));
+            }
             alabels.push(format!("a{i}"));
         }
     }
@@ -313,7 +381,7 @@ fn segments(
         let pads: String = vlabels.iter().map(|l| format!("[{l}]")).collect();
         stmts.push(format!("{pads}concat=n={}:v=1:a=0[vcat]", vlabels.len()));
     }
-    if t.source.has_audio {
+    if has_audio {
         let splices: Vec<&Splice> = t.splices[range.start..range.end - 1].iter().collect();
         audio_chain(&alabels, &splices, "achain", "ax", stmts);
     }
@@ -594,11 +662,62 @@ fn finish(
             });
         }
     }
-    stmts.push(format!(
-        "[{base}]{pre}{subs}{}[vout]",
-        encoder.upload_filter()
-    ));
-    if t.source.has_audio {
+    if t.logo.is_none() && !t.output.progress_bar {
+        stmts.push(format!(
+            "[{base}]{pre}{subs}{}[vout]",
+            encoder.upload_filter()
+        ));
+    } else {
+        let (w, h) = (t.output.width, t.output.height);
+        let dur = t.duration_us as f64 / 1e6;
+        stmts.push(format!("[{base}]{pre}{subs}null[vs]"));
+        base = "vs".to_owned();
+        if let Some(l) = &t.logo {
+            let input = extra_base + extra.len();
+            extra.push(ExtraInput::Still {
+                path: l.path.clone(),
+                len_s: dur + 0.1,
+            });
+            let (wf, hf) = (f64::from(w), f64::from(h));
+            let (x, y) = match l.placement {
+                LogoPlacement::TopCenter => ("(W-w)/2".to_owned(), format!("{:.0}", hf * 0.024)),
+                LogoPlacement::TopLeft => {
+                    (format!("{:.0}", wf * 0.04), format!("{:.0}", hf * 0.024))
+                }
+                LogoPlacement::TopRight => (
+                    format!("W-w-{:.0}", wf * 0.04),
+                    format!("{:.0}", hf * 0.024),
+                ),
+                LogoPlacement::BottomCenter => {
+                    ("(W-w)/2".to_owned(), format!("H-h-{:.0}", hf * 0.14))
+                }
+            };
+            stmts.push(format!(
+                "[{input}:v:0]scale={}:-2:flags=lanczos,format=rgba[logo]",
+                l.width
+            ));
+            stmts.push(format!(
+                "[{base}][logo]overlay=x={x}:y={y}:eof_action=repeat:shortest=1[vl]"
+            ));
+            base = "vl".to_owned();
+        }
+        if t.output.progress_bar {
+            // A yellow bar that grows from the left edge to full width.
+            let bh = (((f64::from(h) * 0.0065).round() as u32) / 2 * 2).max(2);
+            stmts.push(format!(
+                "color=c=0xFFE600:s={w}x{bh}:r={}/{}:d={:.6}[pbar]",
+                t.output.fps.num,
+                t.output.fps.den,
+                dur + 0.5
+            ));
+            stmts.push(format!(
+                "[{base}][pbar]overlay=x='-w+w*t/{dur:.6}':y=H-h:shortest=1[vp]"
+            ));
+            base = "vp".to_owned();
+        }
+        stmts.push(format!("[{base}]{}[vout]", encoder.upload_filter()));
+    }
+    if t.has_audio() {
         let music = t.sound.as_ref().and_then(|s| s.music.as_ref()).map(|m| {
             extra.push(ExtraInput::Looped {
                 path: m.path.clone(),
@@ -651,6 +770,9 @@ mod tests {
                 audio: UsRange::new(v.start_us - 10_000, v.end_us + 10_000),
                 output_start_us: out,
                 camera: cam,
+                source: 0,
+                speed: 1.0,
+                gamma: 1.0,
             }
         };
         ResolvedTimeline {
@@ -672,6 +794,7 @@ mod tests {
                 grade: Default::default(),
                 audio_mix: Default::default(),
                 opening_pop: false,
+                progress_bar: false,
             },
             segments: vec![
                 seg(0, 30, 90, 0, path(vec![kf(0, 656.25, 607.5)])),
@@ -692,6 +815,9 @@ mod tests {
             captions: None,
             inserts: Vec::new(),
             sound: None,
+            extra_sources: Vec::new(),
+            texts: Vec::new(),
+            logo: None,
             duration_us: 4_000_000,
         }
     }
@@ -732,7 +858,7 @@ mod tests {
         assert!((g.inputs[0].seek_s - (1.0 - 1.0 / 60.0)).abs() < 1e-6);
         assert!((g.inputs[1].seek_s - 0.99).abs() < 1e-9);
         let f = &g.filter;
-        assert!(f.contains("[0:v:0]tpad=stop_mode=clone:stop=3,trim=end_frame=60,setpts=PTS-STARTPTS,crop=608:1080:656:0:exact=1,scale=1080:1920"), "{f}");
+        assert!(f.contains("[0:v:0]fps=30/1,tpad=stop_mode=clone:stop=3,trim=end_frame=60,setpts=PTS-STARTPTS,crop=608:1080:656:0:exact=1,scale=1080:1920"), "{f}");
         assert!(
             f.contains("[1:a:0]aresample=48000,atrim=duration=2.020000,apad=whole_dur=2.020000"),
             "{f}"
@@ -954,6 +1080,80 @@ mod tests {
         assert!(g.filter.contains("[v0]null[vcat]"));
         assert!(g.filter.ends_with("[vcat]format=nv12,hwupload[vout]"));
         assert!(!g.has_audio);
+    }
+
+    #[test]
+    fn speed_silent_sources_logo_and_progress_bar() {
+        use detent_core::edl::LogoPlacement;
+        use detent_core::timeline::{ResolvedLogo, TimelineSource};
+        let mut t = timeline();
+        // Segment 1 reads a silent 25 fps source at half speed.
+        t.extra_sources = vec![TimelineSource {
+            path: "broll.mp4".into(),
+            width: 1080,
+            height: 1920,
+            fps: FrameRate::new(25, 1).unwrap(),
+            duration_us: 60_000_000,
+            has_audio: false,
+        }];
+        let s = &mut t.segments[1];
+        s.source = 1;
+        s.speed = 0.5;
+        s.gamma = 1.25;
+        s.video = FrameRange::new(250, 300, FrameRate::new(25, 1).unwrap());
+        s.camera = path(vec![CropKeyframe {
+            t_us: 0,
+            x: 0.0,
+            y: 0.0,
+            w: 1080.0,
+            h: 1920.0,
+        }]);
+        s.audio = UsRange::new(s.video.start_us - 5_000, s.video.end_us);
+        t.duration_us = 2_000_000 + t.segments[1].output_len_us();
+        t.logo = Some(ResolvedLogo {
+            path: "logo.png".into(),
+            placement: LogoPlacement::TopRight,
+            width: 300,
+        });
+        t.output.progress_bar = true;
+        let g = compile(&t, Encoder::Libx264, None);
+        // Video input of segment 1 reads source 1; no audio input for it.
+        assert_eq!(g.inputs.len(), 3);
+        assert_eq!(g.inputs[2].source, 1);
+        let f = &g.filter;
+        assert!(f.contains("[2:v:0]fps=25/1,tpad"), "{f}");
+        assert!(f.contains("eq=gamma=1.250"), "{f}");
+        assert!(
+            f.contains(&format!(
+                ",setpts=(PTS-STARTPTS)/0.500000,fps=30/1,tpad=stop_mode=clone:stop=4,trim=end_frame={}",
+                t.output_frames(1)
+            )),
+            "{f}"
+        );
+        assert_eq!(t.output_frames(1), 120);
+        assert!(
+            f.contains("anullsrc=r=48000:cl=stereo,atrim=duration=4.010000"),
+            "{f}"
+        );
+        assert!(
+            f.contains("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a0]"),
+            "{f}"
+        );
+        assert!(matches!(&g.extra[..], [ExtraInput::Still { path, .. }] if path == "logo.png"));
+        assert!(
+            f.contains("[3:v:0]scale=300:-2:flags=lanczos,format=rgba[logo]"),
+            "{f}"
+        );
+        assert!(f.contains("[vs][logo]overlay=x=W-w-43:y=46"), "{f}");
+        assert!(f.contains("color=c=0xFFE600:s=1080x12:r=30/1"), "{f}");
+        assert!(
+            f.contains("[vl][pbar]overlay=x='-w+w*t/6.000000':y=H-h:shortest=1[vp]"),
+            "{f}"
+        );
+        assert!(f.contains("[vp]format=yuv420p[vout]"), "{f}");
+        assert_eq!(atempo(0.25), "atempo=0.5,atempo=0.500000");
+        assert_eq!(atempo(3.0), "atempo=2,atempo=1.500000");
+        assert_eq!(atempo(1.5), "atempo=1.500000");
     }
 
     #[test]

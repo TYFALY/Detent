@@ -22,6 +22,7 @@
 
 pub mod align;
 pub mod camera;
+pub mod campaign;
 pub mod captions;
 pub mod dsp;
 pub mod edl;

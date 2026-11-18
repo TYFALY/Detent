@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::camera::CameraPath;
 use crate::captions::CaptionBlock;
 use crate::edl::{
-    AspectPreset, AudioMix, CaptionPosition, CaptionStyle, ColorGrade, InsertPlacement, MusicSpec,
-    WordColor,
+    AspectPreset, AudioMix, CaptionPosition, CaptionStyle, ColorGrade, InsertPlacement,
+    LogoPlacement, MusicSpec, TextPosition, TextStyle, WordColor,
 };
 use crate::time::{FrameRate, UsRange};
 
@@ -52,19 +52,62 @@ impl FrameRange {
     }
 }
 
+fn one() -> f64 {
+    1.0
+}
+
+fn is_one(x: &f64) -> bool {
+    *x == 1.0
+}
+
+fn is_zero(x: &usize) -> bool {
+    *x == 0
+}
+
 /// One clip on the output timeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ResolvedSegment {
     /// Index of the originating EDL clip.
     pub clip_index: usize,
-    /// Source video frames.
+    /// Which source this segment reads (0 = `source`, k = `extra_sources[k-1]`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source: usize,
+    /// Source video frames (in that source's frame rate).
     pub video: FrameRange,
     /// Source audio range including crossfade handles (µs).
     pub audio: UsRange,
     /// Where this segment's picture starts on the output timeline (µs).
     pub output_start_us: i64,
-    /// Solved virtual camera.
+    /// Solved virtual camera (source pixels; time from the segment start in
+    /// source µs).
     pub camera: CameraPath,
+    /// Playback speed (output duration = source duration / speed).
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub speed: f64,
+    /// Mid-tone gamma applied to this segment (1 = unchanged).
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub gamma: f64,
+}
+
+impl ResolvedSegment {
+    /// Duration of this segment on the output timeline (µs).
+    pub fn output_len_us(&self) -> i64 {
+        scale_us(self.video.len_us(), self.speed)
+    }
+
+    /// Output duration of this segment's audio, handles included (µs).
+    pub fn audio_output_len_us(&self) -> i64 {
+        scale_us(self.audio.len_us(), self.speed)
+    }
+}
+
+/// `us / speed`, rounded (exact for speed 1).
+pub fn scale_us(us: i64, speed: f64) -> i64 {
+    if speed == 1.0 {
+        us
+    } else {
+        (us as f64 / speed).round() as i64
+    }
 }
 
 /// Audio crossfade at an internal splice.
@@ -119,6 +162,32 @@ pub struct ResolvedChapter {
     pub end_us: i64,
 }
 
+/// On-screen text on the output timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedText {
+    /// Text (a newline is a line break).
+    pub text: String,
+    /// Output start (µs).
+    pub start_us: i64,
+    /// Output end (µs, exclusive).
+    pub end_us: i64,
+    /// Placement.
+    pub position: TextPosition,
+    /// Look.
+    pub style: TextStyle,
+}
+
+/// A logo over the whole edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedLogo {
+    /// Image path as written in the EDL.
+    pub path: String,
+    /// Placement.
+    pub placement: LogoPlacement,
+    /// Width in output pixels (even).
+    pub width: u32,
+}
+
 /// An image/video card or B-roll cutaway on the output timeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ResolvedInsert {
@@ -155,6 +224,9 @@ pub struct OutputFormat {
     /// First segment scales in 100% → 108% over 0.4 s.
     #[serde(default)]
     pub opening_pop: bool,
+    /// Draw a progress bar along the bottom edge.
+    #[serde(default)]
+    pub progress_bar: bool,
 }
 
 /// Resolved composition.
@@ -224,6 +296,16 @@ pub struct ResolvedTimeline {
     /// Sound design, if requested.
     #[serde(default)]
     pub sound: Option<ResolvedSound>,
+    /// Sources after the first, for multi-source edits (segment `source` k
+    /// reads `extra_sources[k - 1]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_sources: Vec<TimelineSource>,
+    /// On-screen texts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<ResolvedText>,
+    /// Logo over the whole edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<ResolvedLogo>,
     /// Total output duration (µs).
     pub duration_us: i64,
 }
@@ -271,23 +353,70 @@ pub struct ResolvedSound {
 }
 
 impl ResolvedTimeline {
+    /// Source `k` (0 = `source`).
+    pub fn source_at(&self, k: usize) -> Option<&TimelineSource> {
+        if k == 0 {
+            Some(&self.source)
+        } else {
+            self.extra_sources.get(k - 1)
+        }
+    }
+
+    /// The source a segment reads (falls back to the main source).
+    pub fn source_of(&self, seg: &ResolvedSegment) -> &TimelineSource {
+        self.source_at(seg.source).unwrap_or(&self.source)
+    }
+
+    /// True when the output has a sound track: any source has audio, or
+    /// sound design was requested (silent sources contribute silence).
+    pub fn has_audio(&self) -> bool {
+        self.sound.is_some()
+            || self.source.has_audio
+            || self.extra_sources.iter().any(|s| s.has_audio)
+    }
+
+    /// Frames segment `i` occupies in the output (at the output frame rate).
+    /// With a speed change or another frame rate, boundaries are rounded on
+    /// the cumulative output clock, so the total never drifts by more than
+    /// half a frame.
+    pub fn output_frames(&self, i: usize) -> i64 {
+        let Some(s) = self.segments.get(i) else {
+            return 0;
+        };
+        let fps = self.output.fps;
+        if s.speed == 1.0 && self.source_of(s).fps == fps {
+            return s.video.frames();
+        }
+        let a = fps.nearest_frame(s.output_start_us);
+        let b = fps.nearest_frame(s.output_start_us + s.output_len_us());
+        b - a
+    }
+
+    /// Frames in the whole output.
+    pub fn total_output_frames(&self) -> i64 {
+        (0..self.segments.len())
+            .map(|i| self.output_frames(i))
+            .sum()
+    }
+
     /// True when any segment needs a moving or non-identity crop.
     pub fn needs_reframe(&self) -> bool {
         if matches!(self.output.layout, Layout::FitBlur { .. }) {
             return true;
         }
-        let (sw, sh) = (f64::from(self.source.width), f64::from(self.source.height));
-        let same_raster =
-            self.output.width == self.source.width && self.output.height == self.source.height;
         self.segments.iter().any(|s| {
-            !s.camera.is_static()
+            let src = self.source_of(s);
+            let (sw, sh) = (f64::from(src.width), f64::from(src.height));
+            let same_raster = self.output.width == src.width && self.output.height == src.height;
+            !same_raster
+                || !s.camera.is_static()
                 || s.camera.keyframes.first().is_some_and(|k| {
                     k.x.abs() > 0.5
                         || k.y.abs() > 0.5
                         || (k.w - sw).abs() > 0.5
                         || (k.h - sh).abs() > 0.5
                 })
-        }) || !same_raster
+        })
     }
 
     /// Parses a timeline and checks every invariant.
@@ -314,8 +443,7 @@ impl ResolvedTimeline {
     /// depth on untrusted files) and the property tests.
     pub fn verify(&self) -> Vec<String> {
         let mut v = Vec::new();
-        let fps = self.source.fps;
-        let dur = self.source.duration_us;
+        let has_audio = self.has_audio();
         if self.segments.is_empty() {
             v.push("timeline has no segments".to_owned());
         }
@@ -335,10 +463,21 @@ impl ResolvedTimeline {
         let mut t_out = 0_i64;
         let mut video_total = 0_i64;
         let mut audio_total = 0_i64;
-        let (sw, sh) = (f64::from(self.source.width), f64::from(self.source.height));
         let (pw, ph) = self.output.picture_size();
         let aspect = f64::from(pw) / f64::from(ph.max(1));
         for (i, s) in self.segments.iter().enumerate() {
+            let Some(src) = self.source_at(s.source) else {
+                v.push(format!("segment {i}: source {} does not exist", s.source));
+                continue;
+            };
+            let (fps, dur) = (src.fps, src.duration_us);
+            let (sw, sh) = (f64::from(src.width), f64::from(src.height));
+            if !(0.25..=4.0).contains(&s.speed) {
+                v.push(format!("segment {i}: speed {} outside 0.25..=4", s.speed));
+            }
+            if !(0.5..=2.0).contains(&s.gamma) {
+                v.push(format!("segment {i}: gamma {} outside 0.5..=2", s.gamma));
+            }
             let fr = s.video;
             if fr.frames() <= 0 {
                 v.push(format!("segment {i}: non-positive frame count"));
@@ -357,16 +496,16 @@ impl ResolvedTimeline {
                     s.output_start_us
                 ));
             }
-            t_out += fr.len_us();
-            video_total += fr.len_us();
-            if self.source.has_audio {
+            t_out += s.output_len_us();
+            video_total += s.output_len_us();
+            if has_audio {
                 if s.audio.len_us() <= 0 {
                     v.push(format!("segment {i}: non-positive audio duration"));
                 }
                 if s.audio.start_us < 0 || s.audio.end_us > dur {
                     v.push(format!("segment {i}: audio outside source"));
                 }
-                audio_total += s.audio.len_us();
+                audio_total += s.audio_output_len_us();
             }
             let eps = 1e-6 * sw.max(sh);
             for (k, kf) in s.camera.keyframes.iter().enumerate() {
@@ -413,16 +552,24 @@ impl ResolvedTimeline {
                     sp.crossfade_us
                 ));
             }
-            if self.source.has_audio {
-                let a = self.segments.get(k).map_or(0, |s| s.audio.len_us());
-                let b = self.segments.get(k + 1).map_or(0, |s| s.audio.len_us());
+            if has_audio {
+                let a = self
+                    .segments
+                    .get(k)
+                    .map_or(0, ResolvedSegment::audio_output_len_us);
+                let b = self
+                    .segments
+                    .get(k + 1)
+                    .map_or(0, ResolvedSegment::audio_output_len_us);
                 if sp.crossfade_us > a.min(b) {
                     v.push(format!("splice {k}: crossfade longer than adjacent audio"));
                 }
             }
             xfade_total += sp.crossfade_us;
         }
-        if self.source.has_audio && audio_total - xfade_total != video_total {
+        // Speed changes round each segment to the µs; allow exactly that.
+        let slack = 2 * self.segments.iter().filter(|s| s.speed != 1.0).count() as i64;
+        if has_audio && (audio_total - xfade_total - video_total).abs() > slack {
             v.push(format!(
                 "A/V drift: audio {audio_total}µs - crossfades {xfade_total}µs != video {video_total}µs"
             ));
@@ -460,9 +607,16 @@ impl ResolvedTimeline {
             if s.sfx.windows(2).any(|w| w[1].at_us < w[0].at_us) {
                 v.push("sound effects not sorted".to_owned());
             }
-            if !self.source.has_audio {
-                v.push("sound design without source audio".to_owned());
+        }
+        for (k, t) in self.texts.iter().enumerate() {
+            if t.end_us <= t.start_us || t.start_us < 0 || t.end_us > self.duration_us {
+                v.push(format!("text {k}: invalid display range"));
             }
+        }
+        if let Some(l) = &self.logo
+            && (l.width == 0 || l.width > self.output.width)
+        {
+            v.push("logo wider than the frame".to_owned());
         }
         v
     }

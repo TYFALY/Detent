@@ -25,4 +25,7 @@ pub mod graph;
 
 pub use encoder::{Encoder, EncoderChoice, FfmpegInfo, Quality, Tools};
 pub use error::{RenderError, Result};
-pub use exec::{Progress, RenderMetrics, RenderMode, RenderOptions, Renderer, copy_eligible};
+pub use exec::{
+    Progress, RenderMetrics, RenderMode, RenderOptions, Renderer, capped_video_kbps, copy_eligible,
+    has_burned_text,
+};

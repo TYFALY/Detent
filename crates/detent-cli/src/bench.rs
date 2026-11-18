@@ -159,6 +159,8 @@ pub fn run(input: Option<&Path>, seconds: f32) -> Result<()> {
     // 5. Rendering: 3 clips → 9:16 with motion + captions-free (no transcript).
     let dur = i.source.duration_ms;
     let clip = |a: u64, b: u64| EdlClip {
+        source: 0,
+        speed: None,
         start_ms: a,
         end_ms: b,
         hook_score: 0.5,
@@ -179,6 +181,9 @@ pub fn run(input: Option<&Path>, seconds: f32) -> Result<()> {
         word_colors: Vec::new(),
         chapters: Vec::new(),
         inserts: Vec::new(),
+        texts: Vec::new(),
+        drop_freezes: true,
+        logo: None,
         sound: None,
         headline_duration_ms: None,
         video_transitions: Vec::new(),
@@ -209,6 +214,7 @@ pub fn run(input: Option<&Path>, seconds: f32) -> Result<()> {
                 encoder: enc,
                 mode: RenderMode::Full,
                 batch_segments: None,
+                max_bytes: None,
             },
             &mut |_| {},
         )?;

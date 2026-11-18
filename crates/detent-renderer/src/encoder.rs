@@ -132,6 +132,45 @@ impl Encoder {
         }
         a
     }
+
+    /// Average-bitrate encode at `kbps` kbit/s (peaks capped at 1.25x over a
+    /// two-second buffer), for renders with a file-size limit.
+    pub fn bitrate_args(self, q: Quality, kbps: u32) -> Vec<String> {
+        let rate = |k: u32| format!("{k}k");
+        let mut a: Vec<String> = vec!["-c:v".into(), self.ffmpeg_name().into()];
+        match self {
+            Self::Libx264 => a.extend([
+                "-preset".into(),
+                match q {
+                    Quality::Draft => "veryfast",
+                    Quality::Standard => "medium",
+                    Quality::High => "slow",
+                }
+                .into(),
+                "-profile:v".into(),
+                "high".into(),
+            ]),
+            Self::H264Nvenc => a.extend([
+                "-preset".into(),
+                "p5".into(),
+                "-rc".into(),
+                "vbr".into(),
+                "-profile:v".into(),
+                "high".into(),
+            ]),
+            Self::H264Videotoolbox => a.extend(["-profile:v".into(), "high".into()]),
+            Self::H264Vaapi => a.extend(["-rc_mode".into(), "VBR".into()]),
+        }
+        a.extend([
+            "-b:v".into(),
+            rate(kbps),
+            "-maxrate".into(),
+            rate(kbps + kbps / 4),
+            "-bufsize".into(),
+            rate(kbps * 2),
+        ]);
+        a
+    }
 }
 
 fn vaapi_device() -> String {

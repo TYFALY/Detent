@@ -1,0 +1,14 @@
+{
+  "clips": [
+    { "start_ms": 17000, "end_ms": 20150, "hook_score": 0.9, "editorial_note": "The payoff line as the hook." },
+    { "start_ms": 12560, "end_ms": 15420, "hook_score": 0.6, "editorial_note": "The setup." }
+  ],
+  "tighten": { "max_silence_ms": 200 },
+  "headline": "the trick nobody tells you",
+  "texts": [
+    { "text": "cut the dead air", "clip": 0, "offset_ms": 300, "duration_ms": 1300, "position": "Lower", "style": "Yellow" },
+    { "text": "twice the views", "clip": 0, "offset_ms": 1700, "position": "Lower", "style": "Yellow" },
+    { "text": "here's the trick", "clip": 1, "position": "Lower", "style": "Bold" }
+  ],
+  "output": { "layout": "FitBlur", "opening_pop": true, "progress_bar": true, "audio_mix": "VoiceForward" }
+}

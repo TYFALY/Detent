@@ -23,6 +23,7 @@ pub mod contact;
 pub mod error;
 #[cfg(feature = "ffmpeg-cli")]
 pub mod ffmpeg;
+pub mod freeze;
 pub mod pipeline;
 #[cfg(feature = "ffmpeg-cli")]
 pub mod probe;
@@ -39,6 +40,7 @@ pub mod whisper_cli;
 
 pub use contact::{ContactSheetBuilder, GridSpec};
 pub use error::{IndexError, Result};
+pub use freeze::{FreezeConfig, FreezeDetector};
 pub use pipeline::{IndexOptions, IndexStats, Indexed, analyze};
 #[cfg(feature = "ffmpeg-cli")]
 pub use pipeline::{contact_sheet_range, index_file};

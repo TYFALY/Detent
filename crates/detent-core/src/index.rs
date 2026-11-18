@@ -221,6 +221,37 @@ pub struct VisualTelemetry {
     pub subjects: Vec<SubjectBox>,
     /// Contact sheet, if generated.
     pub contact_sheet: Option<ContactSheet>,
+    /// Stretches where the picture froze (repeated frames from stream lag or
+    /// dropped frames) while the surrounding footage moves, sorted by time.
+    #[serde(default)]
+    pub freezes: Vec<FreezeInterval>,
+    /// Mean luma (0 black .. 1 white) of each second of video.
+    #[serde(default)]
+    pub luma_per_s: Vec<f32>,
+}
+
+/// A frozen-picture stretch: `[start_ms, end_ms)` repeats the frame before
+/// `start_ms`; the picture moves again at `end_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FreezeInterval {
+    /// First repeated frame (ms).
+    pub start_ms: u64,
+    /// First new frame after the freeze (ms).
+    pub end_ms: u64,
+}
+
+impl VisualTelemetry {
+    /// Mean luma over `[start_ms, end_ms)`, or `None` without samples.
+    pub fn mean_luma(&self, start_ms: u64, end_ms: u64) -> Option<f32> {
+        let n = self.luma_per_s.len() as u64;
+        if n == 0 {
+            return None;
+        }
+        let a = (start_ms / 1_000).min(n - 1);
+        let b = end_ms.div_ceil(1_000).clamp(a + 1, n);
+        let s = &self.luma_per_s[a as usize..b as usize];
+        Some(s.iter().sum::<f32>() / s.len() as f32)
+    }
 }
 
 impl MediaIndex {
@@ -276,6 +307,14 @@ impl MediaIndex {
                 issues.push(ValidationIssue::new(
                     format!("/audio/pauses/{i}"),
                     "pause must satisfy start < end and start <= valley <= end",
+                ));
+            }
+        }
+        for (i, f) in self.visual.freezes.iter().enumerate() {
+            if f.end_ms <= f.start_ms {
+                issues.push(ValidationIssue::new(
+                    format!("/visual/freezes/{i}"),
+                    "freeze must satisfy start_ms < end_ms",
                 ));
             }
         }
@@ -467,6 +506,18 @@ pub struct IndexDigest {
     pub contact_sheet: Option<String>,
     /// Footage type inferred from subject sizes, if subjects were detected.
     pub framing_hint: Option<FramingHint>,
+    /// Whether the file has a sound track (clips from silent files get
+    /// silence, so they still mix with clips that have sound).
+    #[serde(default)]
+    pub has_audio: bool,
+    /// Frozen-picture stretches `[start_ms, end_ms]`; the solver cuts them
+    /// out of chosen clips unless the EDL sets `drop_freezes: false`.
+    #[serde(default)]
+    pub freezes_ms: Vec<(u64, u64)>,
+    /// Mean brightness of the whole video (0 black .. 1 white); below ~0.3
+    /// consider `output.exposure`.
+    #[serde(default)]
+    pub mean_luma: Option<f32>,
 }
 
 /// Limits for [`MediaIndex::digest`].
@@ -582,6 +633,17 @@ impl MediaIndex {
             loudness_step_ms: per as u64 * hop,
             contact_sheet: self.visual.contact_sheet.as_ref().map(|c| c.path.clone()),
             framing_hint: self.framing_hint(),
+            has_audio: self.source.audio.is_some(),
+            freezes_ms: self
+                .visual
+                .freezes
+                .iter()
+                .map(|f| (f.start_ms, f.end_ms))
+                .collect(),
+            mean_luma: self
+                .visual
+                .mean_luma(0, self.source.duration_ms)
+                .map(|l| (l * 100.0).round() / 100.0),
         }
     }
 }

@@ -51,6 +51,17 @@ pub enum RenderError {
         written: u64,
     },
 
+    /// The output stayed above the size limit even at a reduced bitrate.
+    #[error(
+        "output is {bytes} bytes, over the {max}-byte limit even after re-encoding at a lower bitrate; shorten the edit"
+    )]
+    TooLarge {
+        /// Final size.
+        bytes: u64,
+        /// Limit.
+        max: u64,
+    },
+
     /// Filesystem error.
     #[error("I/O error on {path}: {source}")]
     Io {

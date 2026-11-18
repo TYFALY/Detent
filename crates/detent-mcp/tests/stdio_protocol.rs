@@ -104,8 +104,8 @@ fn lists_tools_with_strict_schemas() {
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         names.len(),
-        4,
-        "index_media, inspect_keyframes, solve_and_validate_edl, render_timeline: {names:?}"
+        5,
+        "index_media, inspect_keyframes, solve_and_validate_edl, render_timeline, check_campaign: {names:?}"
     );
     let solve = tools
         .iter()
@@ -113,6 +113,7 @@ fn lists_tools_with_strict_schemas() {
         .unwrap();
     let schema = solve["inputSchema"].to_string();
     assert!(schema.contains("SmoothTrackSubject") && schema.contains("hook_score"));
+    assert!(schema.contains("extra_index_paths") && schema.contains("TextOverlay"));
 }
 
 #[test]

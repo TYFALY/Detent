@@ -180,6 +180,8 @@ pub fn synthetic_index(duration_ms: u64, seed: u32) -> MediaIndex {
             shots,
             subjects,
             contact_sheet: None,
+            freezes: Vec::new(),
+            luma_per_s: Vec::new(),
         },
     }
 }
@@ -204,6 +206,8 @@ pub fn synthetic_edl(index: &MediaIndex, clips: usize, seed: u32) -> SemanticEdl
         .map(|i| {
             let start = rng.range(0, dur.saturating_sub(10_000).max(1));
             EdlClip {
+                source: 0,
+                speed: None,
                 start_ms: start,
                 end_ms: (start + rng.range(4_000, 9_000)).min(dur),
                 hook_score: if i == 0 { 0.9 } else { 0.5 },
@@ -235,6 +239,9 @@ pub fn synthetic_edl(index: &MediaIndex, clips: usize, seed: u32) -> SemanticEdl
         word_colors: Vec::new(),
         chapters: Vec::new(),
         inserts: Vec::new(),
+        texts: Vec::new(),
+        drop_freezes: true,
+        logo: None,
         sound: None,
         headline_duration_ms: None,
         video_transitions: (0..clips.saturating_sub(1))

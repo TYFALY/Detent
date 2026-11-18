@@ -76,15 +76,52 @@ pub struct SemanticEdl {
     /// Automatic dead-air removal inside clips. Omit to keep clips as chosen.
     #[serde(default)]
     pub tighten: Option<TightenSpec>,
+    /// On-screen text that does not come from speech: "show this text from
+    /// here to here". Works without a transcript (music trailers, silent
+    /// product footage), e.g. a line per clip.
+    #[serde(default)]
+    pub texts: Vec<TextOverlay>,
+    /// Cut out frozen-picture stretches (dropped frames from stream lag)
+    /// that the indexer found inside the chosen clips. On by default.
+    #[serde(default = "default_true")]
+    pub drop_freezes: bool,
+    /// A logo or watermark image over the whole edit.
+    #[serde(default)]
+    pub logo: Option<Logo>,
     /// Output framing.
     #[serde(default)]
     pub output: OutputSpec,
 }
 
+/// Clips after [`SemanticEdl::split_clips`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Split {
+    /// The expanded EDL (one clip per piece, `tighten` cleared).
+    pub edl: SemanticEdl,
+    /// Original clip index of every piece.
+    pub origin: Vec<usize>,
+    /// Dead air removed (ms).
+    pub pause_ms: u64,
+    /// Frozen picture removed (ms).
+    pub freeze_ms: u64,
+    /// Freezes removed or trimmed away.
+    pub freezes: usize,
+    /// Pauses removed.
+    pub pauses: usize,
+}
+
+/// Slowest and fastest accepted clip speed.
+pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.25..=4.0;
+
 /// One source range.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EdlClip {
+    /// Which indexed video this clip comes from: 0 is the main `index_path`,
+    /// 1, 2, ... are the extra indexes in the order they were passed. Lets
+    /// one edit combine a whole folder of footage.
+    #[serde(default)]
+    pub source: usize,
     /// Approximate in-point in source milliseconds. The solver snaps it into
     /// the nearest breath/silence valley within the snap tolerance (±120 ms).
     pub start_ms: u64,
@@ -96,6 +133,114 @@ pub struct EdlClip {
     /// One short sentence explaining the editorial choice.
     #[schemars(length(max = 280))]
     pub editorial_note: String,
+    /// Playback speed, 0.25-4.0 (default 1). 0.5 is a half-speed slow-mo
+    /// replay: repeat the payoff range as a second clip with `speed: 0.5`.
+    /// Audio is time-stretched with its pitch kept.
+    #[serde(default)]
+    #[schemars(range(min = 0.25, max = 4.0))]
+    pub speed: Option<f32>,
+}
+
+impl EdlClip {
+    /// Effective speed (1.0 when unset).
+    pub fn speed(&self) -> f64 {
+        f64::from(self.speed.unwrap_or(1.0))
+    }
+}
+
+/// On-screen text placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum TextPosition {
+    /// Upper third, clear of the platform's top bar (the usual hook spot).
+    #[default]
+    Upper,
+    /// Centre of the frame.
+    Center,
+    /// Lower third, above the platform's caption area.
+    Lower,
+}
+
+/// Look of an on-screen text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum TextStyle {
+    /// Heavy white type with a thick black stroke that pops in.
+    #[default]
+    Bold,
+    /// Black type in a white box (like the headline).
+    Boxed,
+    /// Heavy yellow type with a black stroke.
+    Yellow,
+}
+
+/// Text shown from a point in one clip to a later point, independent of
+/// speech and captions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextOverlay {
+    /// The text. A newline forces a line break.
+    #[schemars(length(min = 1, max = 120))]
+    pub text: String,
+    /// Index into `clips`: the text appears during this clip.
+    pub clip: usize,
+    /// Delay from the clip's start in the output (ms).
+    #[serde(default)]
+    pub offset_ms: u32,
+    /// Time on screen (ms). Omit to keep it up until the end of `end_clip`
+    /// (or of `clip` when `end_clip` is omitted).
+    #[serde(default)]
+    #[schemars(range(min = 300, max = 60000))]
+    pub duration_ms: Option<u32>,
+    /// With no `duration_ms`, the clip whose end removes the text.
+    #[serde(default)]
+    pub end_clip: Option<usize>,
+    /// Placement.
+    #[serde(default)]
+    pub position: TextPosition,
+    /// Look.
+    #[serde(default)]
+    pub style: TextStyle,
+}
+
+/// Where the logo sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum LogoPlacement {
+    /// Top centre.
+    #[default]
+    TopCenter,
+    /// Top left corner.
+    TopLeft,
+    /// Top right corner.
+    TopRight,
+    /// Bottom centre, above the platform UI.
+    BottomCenter,
+}
+
+/// A logo / watermark image over the whole edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Logo {
+    /// PNG (transparency kept), JPEG or WebP image.
+    #[schemars(length(min = 1))]
+    pub path: String,
+    /// Placement preset.
+    #[serde(default)]
+    pub placement: LogoPlacement,
+    /// Logo width as a percentage of the frame width (10-60, default 28).
+    #[serde(default)]
+    #[schemars(range(min = 10, max = 60))]
+    pub width_pct: Option<u8>,
+}
+
+/// Brightness correction for dark footage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+pub enum Exposure {
+    /// Leave the brightness alone.
+    #[default]
+    None,
+    /// Lift the mid-tones of every clip (gamma 1.25), for dark game footage.
+    Lift,
+    /// Measure each clip and lift only the dark ones, more for darker clips.
+    Auto,
 }
 
 /// Camera motion preset. Purely semantic; geometry is solved deterministically.
@@ -539,6 +684,12 @@ pub struct OutputSpec {
     /// 0.4 s so the very first frame already feels alive.
     #[serde(default)]
     pub opening_pop: bool,
+    /// Brightness correction for dark footage.
+    #[serde(default)]
+    pub exposure: Exposure,
+    /// A thin bar along the bottom edge that fills as the video plays.
+    #[serde(default)]
+    pub progress_bar: bool,
 }
 
 /// How the source picture fills the output raster.
@@ -573,6 +724,8 @@ impl Default for OutputSpec {
             grade: ColorGrade::default(),
             audio_mix: AudioMix::default(),
             opening_pop: false,
+            exposure: Exposure::default(),
+            progress_bar: false,
         }
     }
 }
@@ -628,25 +781,87 @@ impl SemanticEdl {
     /// shorter than [`MIN_CLIP_MS`], and each cut keeps 60 ms of room tone on
     /// both sides so speech never sounds clipped.
     pub fn tightened(&self, index: &MediaIndex, max_silence_ms: u32) -> (Self, Vec<usize>, u64) {
+        let s = self.split_clips(std::slice::from_ref(index), Some(max_silence_ms), false);
+        (s.edl, s.origin, s.pause_ms)
+    }
+
+    /// Splits clips around the stretches that should not reach the output:
+    /// pauses longer than `max_silence_ms` (dead-air removal, when given) and,
+    /// with `drop_freezes`, frozen-picture stretches from each clip's own
+    /// source index. A freeze at a clip's edge trims the clip instead. No
+    /// piece is shorter than [`MIN_CLIP_MS`]; annotations follow the pieces
+    /// as described for [`Self::tightened`].
+    pub fn split_clips(
+        &self,
+        indexes: &[MediaIndex],
+        max_silence_ms: Option<u32>,
+        drop_freezes: bool,
+    ) -> Split {
         const KEEP_MS: u64 = 60;
         let mut clips = Vec::new();
         let mut origin = Vec::new();
-        let mut removed_ms = 0_u64;
+        let (mut pause_ms, mut freeze_ms, mut freezes, mut pauses) =
+            (0_u64, 0_u64, 0_usize, 0_usize);
         for (i, c) in self.clips.iter().enumerate() {
-            let mut start = c.start_ms;
-            for p in &index.audio.pauses {
-                if p.end_ms.saturating_sub(p.start_ms) <= u64::from(max_silence_ms) {
-                    continue;
+            let Some(index) = indexes.get(c.source) else {
+                clips.push(c.clone());
+                origin.push(i);
+                continue;
+            };
+            let (mut lo, mut hi) = (c.start_ms, c.end_ms);
+            // (start, end, is_freeze) ranges to remove from inside the clip.
+            let mut cuts: Vec<(u64, u64, bool)> = Vec::new();
+            if drop_freezes {
+                for f in &index.visual.freezes {
+                    if f.end_ms <= lo || f.start_ms >= hi {
+                        continue;
+                    }
+                    if f.start_ms <= lo {
+                        if hi.saturating_sub(f.end_ms) >= MIN_CLIP_MS {
+                            freeze_ms += f.end_ms - lo;
+                            freezes += 1;
+                            lo = f.end_ms;
+                        }
+                    } else if f.end_ms >= hi {
+                        if f.start_ms.saturating_sub(lo) >= MIN_CLIP_MS {
+                            freeze_ms += hi - f.start_ms;
+                            freezes += 1;
+                            hi = f.start_ms;
+                        }
+                    } else {
+                        cuts.push((f.start_ms, f.end_ms, true));
+                    }
                 }
-                let (ps, pe) = (p.start_ms + KEEP_MS, p.end_ms.saturating_sub(KEEP_MS));
-                if pe <= ps || ps < start + MIN_CLIP_MS || pe + MIN_CLIP_MS > c.end_ms {
-                    continue;
+            }
+            if let Some(max) = max_silence_ms {
+                for p in &index.audio.pauses {
+                    if p.end_ms.saturating_sub(p.start_ms) <= u64::from(max) {
+                        continue;
+                    }
+                    let (ps, pe) = (p.start_ms + KEEP_MS, p.end_ms.saturating_sub(KEEP_MS));
+                    let speech = index
+                        .transcript
+                        .iter()
+                        .any(|w| w.start_ms < pe && w.end_ms > ps);
+                    if pe > ps && !speech {
+                        cuts.push((ps, pe, false));
+                    }
                 }
-                let speech = index
-                    .transcript
-                    .iter()
-                    .any(|w| w.start_ms < pe && w.end_ms > ps);
-                if speech {
+            }
+            cuts.sort_by_key(|r| r.0);
+            let mut merged: Vec<(u64, u64, bool)> = Vec::new();
+            for r in cuts {
+                match merged.last_mut() {
+                    Some(m) if r.0 <= m.1 => {
+                        m.1 = m.1.max(r.1);
+                        m.2 |= r.2;
+                    }
+                    _ => merged.push(r),
+                }
+            }
+            let mut start = lo;
+            for (ps, pe, freeze) in merged {
+                if ps < start + MIN_CLIP_MS || pe + MIN_CLIP_MS > hi {
                     continue;
                 }
                 clips.push(EdlClip {
@@ -655,11 +870,18 @@ impl SemanticEdl {
                     ..c.clone()
                 });
                 origin.push(i);
-                removed_ms += pe - ps;
+                if freeze {
+                    freeze_ms += pe - ps;
+                    freezes += 1;
+                } else {
+                    pause_ms += pe - ps;
+                    pauses += 1;
+                }
                 start = pe;
             }
             clips.push(EdlClip {
                 start_ms: start,
+                end_ms: hi,
                 ..c.clone()
             });
             origin.push(i);
@@ -716,6 +938,21 @@ impl SemanticEdl {
                 ..c.clone()
             })
             .collect();
+        // Texts start with the first piece of their clip and, without an
+        // explicit duration, end with the last piece of their end clip.
+        let texts = self
+            .texts
+            .iter()
+            .map(|t| TextOverlay {
+                clip: first_piece(t.clip),
+                end_clip: if t.duration_ms.is_none() {
+                    last_piece(t.end_clip.unwrap_or(t.clip))
+                } else {
+                    t.end_clip.map(first_piece)
+                },
+                ..t.clone()
+            })
+            .collect();
         let edl = Self {
             clips,
             motion_cues,
@@ -723,17 +960,40 @@ impl SemanticEdl {
             video_transitions,
             chapters,
             inserts,
+            texts,
             tighten: None,
             ..self.clone()
         };
-        (edl, origin, removed_ms)
+        Split {
+            edl,
+            origin,
+            pause_ms,
+            freeze_ms,
+            freezes,
+            pauses,
+        }
     }
 
-    /// Semantic validation against a media index. Collects *every* issue.
+    /// Semantic validation against a single media index (every clip uses
+    /// source 0). Collects *every* issue.
     pub fn validate(&self, index: &MediaIndex) -> Result<()> {
+        self.validate_sources(std::slice::from_ref(index))
+    }
+
+    /// Semantic validation against the indexes of every source, in `source`
+    /// order. Collects *every* issue.
+    pub fn validate_sources(&self, indexes: &[MediaIndex]) -> Result<()> {
         let mut issues = Vec::new();
-        let dur = index.source.duration_ms;
         let n = self.clips.len();
+        let used: Vec<&MediaIndex> = {
+            let mut s: Vec<usize> = self.clips.iter().map(|c| c.source).collect();
+            s.sort_unstable();
+            s.dedup();
+            s.into_iter().filter_map(|k| indexes.get(k)).collect()
+        };
+        if indexes.is_empty() {
+            issues.push(ValidationIssue::new("/clips", "no source index given"));
+        }
         if n == 0 {
             issues.push(ValidationIssue::new(
                 "/clips",
@@ -742,6 +1002,35 @@ impl SemanticEdl {
         }
         for (i, c) in self.clips.iter().enumerate() {
             let p = format!("/clips/{i}");
+            let Some(index) = indexes.get(c.source) else {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/source"),
+                    format!(
+                        "source {} out of range: {} index(es) given (0 is the main index, 1.. the extra ones)",
+                        c.source,
+                        indexes.len()
+                    ),
+                ));
+                continue;
+            };
+            let dur = index.source.duration_ms;
+            if let Some(s) = c.speed
+                && (!SPEED_RANGE.contains(&s) || s.is_nan())
+            {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/speed"),
+                    "speed must be within 0.25..=4.0",
+                ));
+            }
+            if index.source.video.is_none() {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/source"),
+                    format!(
+                        "source {} ({}) has no video stream; detent edits audio-visual media",
+                        c.source, index.source.path
+                    ),
+                ));
+            }
             if c.end_ms <= c.start_ms {
                 issues.push(ValidationIssue::new(
                     format!("{p}/end_ms"),
@@ -792,7 +1081,12 @@ impl SemanticEdl {
                     format!("duplicate motion cue for clip {}", m.clip),
                 ));
             }
-            if m.preset != MotionPreset::None && index.source.video.is_none() {
+            let no_video = self
+                .clips
+                .get(m.clip)
+                .and_then(|c| indexes.get(c.source))
+                .is_some_and(|ix| ix.source.video.is_none());
+            if m.preset != MotionPreset::None && no_video {
                 issues.push(ValidationIssue::new(
                     format!("/motion_cues/{i}/preset"),
                     "motion requires a video stream",
@@ -904,9 +1198,6 @@ impl SemanticEdl {
                     "text must be 1-40 characters",
                 ));
             }
-            if self.captions.is_none() {
-                issues.push(ValidationIssue::new(p, "chapters need captions"));
-            }
         }
         for (i, c) in self.inserts.iter().enumerate() {
             let p = format!("/inserts/{i}");
@@ -961,12 +1252,6 @@ impl SemanticEdl {
                     ));
                 }
             }
-            if index.source.audio.is_none() {
-                issues.push(ValidationIssue::new(
-                    "/sound",
-                    "sound design needs a source with an audio stream",
-                ));
-            }
         }
         if let Some(c) = &self.captions {
             let g = c.grouping;
@@ -983,10 +1268,10 @@ impl SemanticEdl {
                     "max_chars must be >= 8",
                 ));
             }
-            if index.transcript.is_empty() {
+            if !used.is_empty() && used.iter().all(|ix| ix.transcript.is_empty()) {
                 issues.push(ValidationIssue::new(
                     "/captions",
-                    "captions requested but the index has no transcript",
+                    "captions requested but no source has a transcript; for on-screen text without speech use `texts`",
                 ));
             }
         }
@@ -996,11 +1281,63 @@ impl SemanticEdl {
                 "height must be within 144..=4320",
             ));
         }
-        if index.source.video.is_none() {
-            issues.push(ValidationIssue::new(
-                "/clips",
-                "source has no video stream; detent edits audio-visual media",
-            ));
+        for (i, t) in self.texts.iter().enumerate() {
+            let p = format!("/texts/{i}");
+            let len = t.text.trim().chars().count();
+            if len == 0 || len > 120 {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/text"),
+                    "text must be 1-120 characters",
+                ));
+            }
+            if t.clip >= n {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/clip"),
+                    format!("clip index {} out of range (0..{n})", t.clip),
+                ));
+            }
+            if let Some(d) = t.duration_ms
+                && !(300..=60000).contains(&d)
+            {
+                issues.push(ValidationIssue::new(
+                    format!("{p}/duration_ms"),
+                    "duration_ms must be within 300..=60000",
+                ));
+            }
+            if let Some(e) = t.end_clip {
+                if e >= n || e < t.clip {
+                    issues.push(ValidationIssue::new(
+                        format!("{p}/end_clip"),
+                        format!("end_clip must be within {}..{n}", t.clip),
+                    ));
+                }
+                if t.duration_ms.is_some() {
+                    issues.push(ValidationIssue::new(
+                        format!("{p}/end_clip"),
+                        "give either duration_ms or end_clip, not both",
+                    ));
+                }
+            }
+        }
+        if let Some(l) = &self.logo {
+            let ext = std::path::Path::new(&l.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase);
+            if !ext.is_some_and(|e| INSERT_EXTENSIONS.contains(&e.as_str())) {
+                issues.push(ValidationIssue::new(
+                    "/logo/path",
+                    format!("logo must be an image ({})", INSERT_EXTENSIONS.join(", ")),
+                ));
+            }
+            if let Some(w) = l.width_pct
+                && !(10..=60).contains(&w)
+            {
+                issues.push(ValidationIssue::new(
+                    "/logo/width_pct",
+                    "width_pct must be within 10..=60",
+                ));
+            }
         }
         if issues.is_empty() {
             Ok(())

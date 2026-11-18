@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use detent_core::ResolvedTimeline;
 use detent_core::captions::{AssExtras, to_ass_with};
+use detent_core::edl::{CaptionPosition, CaptionStyle};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,26 @@ pub struct RenderOptions {
     /// timelines are rendered in lossless batches and joined, so very long
     /// EDLs never open hundreds of inputs at once.
     pub batch_segments: Option<usize>,
+    /// Hard upper limit on the output file size in bytes (e.g. Instagram's
+    /// 10 MB web upload limit). The encode switches to a computed bitrate
+    /// and is redone at a lower one if the file still comes out too big.
+    pub max_bytes: Option<u64>,
+}
+
+/// Audio bitrate used when a size cap is set (kbit/s).
+const CAPPED_AUDIO_KBPS: u32 = 128;
+
+/// Video bitrate (kbit/s) that should land a `duration_us` file under
+/// `max_bytes`, leaving 6% for container overhead and rate-control error.
+pub fn capped_video_kbps(max_bytes: u64, duration_us: i64, has_audio: bool) -> u32 {
+    let secs = (duration_us as f64 / 1e6).max(0.1);
+    let total_kbit = max_bytes as f64 * 8.0 / 1_000.0 * 0.94;
+    let audio_kbit = if has_audio {
+        f64::from(CAPPED_AUDIO_KBPS) * secs
+    } else {
+        0.0
+    };
+    (((total_kbit - audio_kbit) / secs).floor() as u32).max(150)
 }
 
 /// Live progress sample.
@@ -77,6 +98,9 @@ pub struct RenderMetrics {
     pub realtime_factor: f64,
     /// Total extra lead-in caused by snapping to keyframes (stream copy only).
     pub keyframe_drift_ms: Option<u64>,
+    /// Video bitrate used to honour `max_bytes` (kbit/s), if one was set.
+    #[serde(default)]
+    pub video_kbps: Option<u32>,
 }
 
 /// Executes timelines with FFmpeg.
@@ -112,18 +136,53 @@ impl Renderer {
         }
         let output = absolute(output)?;
         if opts.mode == RenderMode::Preview {
-            if copy_eligible(t) {
+            if copy_eligible(t) && opts.max_bytes.is_none() {
                 return self.stream_copy(t, &output, on_progress);
             }
             let draft = RenderOptions {
                 quality: Quality::Draft,
                 ..*opts
             };
-            let mut m = self.full(t, &output, &draft, on_progress)?;
+            let mut m = self.capped(t, &output, &draft, on_progress)?;
             m.mode = "draft_reencode".into();
             return Ok(m);
         }
-        self.full(t, &output, opts, on_progress)
+        self.capped(t, &output, opts, on_progress)
+    }
+
+    /// [`Self::full`], redone at a lower bitrate while the file is larger
+    /// than `opts.max_bytes` (at most three times).
+    fn capped(
+        &self,
+        t: &ResolvedTimeline,
+        output: &Path,
+        opts: &RenderOptions,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<RenderMetrics> {
+        let Some(max) = opts.max_bytes else {
+            return self.full(t, output, opts, None, on_progress);
+        };
+        let mut kbps = capped_video_kbps(max, t.duration_us, t.has_audio());
+        for _ in 0..3 {
+            let mut m = self.full(t, output, opts, Some(kbps), on_progress)?;
+            m.video_kbps = Some(kbps);
+            if m.output_bytes <= max {
+                return Ok(m);
+            }
+            let scaled = f64::from(kbps) * max as f64 / m.output_bytes as f64 * 0.93;
+            kbps = (scaled as u32).max(100);
+        }
+        let m = self.full(t, output, opts, Some(kbps), on_progress)?;
+        if m.output_bytes > max {
+            return Err(RenderError::TooLarge {
+                bytes: m.output_bytes,
+                max,
+            });
+        }
+        Ok(RenderMetrics {
+            video_kbps: Some(kbps),
+            ..m
+        })
     }
 
     fn full(
@@ -131,6 +190,7 @@ impl Renderer {
         t: &ResolvedTimeline,
         output: &Path,
         opts: &RenderOptions,
+        video_kbps: Option<u32>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<RenderMetrics> {
         let encoder = self.info.select(opts.encoder)?;
@@ -138,28 +198,29 @@ impl Renderer {
             .prefix("detent-render-")
             .tempdir()
             .map_err(io_err(Path::new("temp dir")))?;
-        let ass = match &t.captions {
-            Some(c) if !c.blocks.is_empty() => {
-                let doc = to_ass_with(
-                    &c.blocks,
-                    c.style,
-                    c.position,
-                    t.output.width,
-                    t.output.height,
-                    &AssExtras {
-                        headline: c.headline.as_deref(),
-                        highlight_words: &c.highlight_words,
-                        duration_us: t.duration_us,
-                        headline_end_us: c.headline_end_us,
-                        word_colors: &c.word_colors,
-                        chapters: &c.chapters,
-                    },
-                );
-                let p = work.path().join("captions.ass");
-                std::fs::write(&p, doc).map_err(io_err(&p))?;
-                Some("captions.ass")
-            }
-            _ => None,
+        let ass = if has_burned_text(t) {
+            let c = t.captions.as_ref();
+            let doc = to_ass_with(
+                c.map_or(&[][..], |c| &c.blocks),
+                c.map_or(CaptionStyle::default(), |c| c.style),
+                c.map_or(CaptionPosition::default(), |c| c.position),
+                t.output.width,
+                t.output.height,
+                &AssExtras {
+                    headline: c.and_then(|c| c.headline.as_deref()),
+                    highlight_words: c.map_or(&[][..], |c| &c.highlight_words),
+                    duration_us: t.duration_us,
+                    headline_end_us: c.and_then(|c| c.headline_end_us),
+                    word_colors: c.map_or(&[][..], |c| &c.word_colors),
+                    chapters: c.map_or(&[][..], |c| &c.chapters),
+                    texts: &t.texts,
+                },
+            );
+            let p = work.path().join("captions.ass");
+            std::fs::write(&p, doc).map_err(io_err(&p))?;
+            Some("captions.ass")
+        } else {
+            None
         };
         // Inserts and music are read from the caller's working directory,
         // but FFmpeg runs in the temp dir: resolve them up front (and fail
@@ -171,6 +232,7 @@ impl Renderer {
                 .and_then(|s| s.music.as_ref())
                 .map(|m| m.path.as_str()),
         );
+        extra_files.extend(t.logo.as_ref().map(|l| l.path.as_str()));
         let resolved = extra_files
             .into_iter()
             .map(|f| {
@@ -182,17 +244,26 @@ impl Renderer {
         let n = t.segments.len();
         let batch = opts.batch_segments.unwrap_or(BATCH_SEGMENTS).max(1);
         let started = Instant::now();
-        let expected: i64 = t.segments.iter().map(|s| s.video.frames()).sum();
+        let expected: i64 = t.total_output_frames();
+        let sources = source_paths(t);
 
         let mut m = if n <= batch {
             let graph = compile(t, encoder, ass);
             let mut cmd = self.command(work.path(), "graph.txt", &graph.filter)?;
             cmd.args(encoder.global_args());
             for input in &graph.inputs {
-                source_input(&mut cmd, input, &t.source.path);
+                source_input(&mut cmd, input, &sources);
             }
             extra_inputs(&mut cmd, &graph.extra, &resolved, t);
-            self.encode_args(&mut cmd, "graph.txt", graph.has_audio, t, encoder, opts);
+            self.encode_args(
+                &mut cmd,
+                "graph.txt",
+                graph.has_audio,
+                t,
+                encoder,
+                opts,
+                video_kbps,
+            );
             let mut m = run_with_progress(cmd, output, t.duration_us, on_progress)?;
             m.mode = "filtergraph".into();
             m
@@ -209,7 +280,7 @@ impl Renderer {
                 let script = format!("batch{k}.txt");
                 let mut cmd = self.command(work.path(), &script, &graph.filter)?;
                 for input in &graph.inputs {
-                    source_input(&mut cmd, input, &t.source.path);
+                    source_input(&mut cmd, input, &sources);
                 }
                 self.filter_arg(&mut cmd, &script);
                 cmd.args(["-map", "[vout]", "-c:v", "ffv1", "-level", "3"]);
@@ -217,8 +288,11 @@ impl Renderer {
                     cmd.args(["-map", "[aout]", "-c:a", "pcm_f32le"]);
                 }
                 cmd.args(["-fps_mode", "passthrough", "-f", "nut"]);
-                let part_us: i64 = t.segments[r.clone()].iter().map(|s| s.video.len_us()).sum();
-                let part_frames: i64 = t.segments[r.clone()].iter().map(|s| s.video.frames()).sum();
+                let part_us: i64 = t.segments[r.clone()]
+                    .iter()
+                    .map(|s| s.output_len_us())
+                    .sum();
+                let part_frames: i64 = r.clone().map(|i| t.output_frames(i)).sum();
                 let path = work.path().join(format!("batch{k}.nut"));
                 let base = done_us;
                 let pm = run_with_progress(cmd, &path, part_us, &mut |p| {
@@ -244,7 +318,15 @@ impl Renderer {
                 cmd.arg("-i").arg(format!("batch{k}.nut"));
             }
             extra_inputs(&mut cmd, &graph.extra, &resolved, t);
-            self.encode_args(&mut cmd, "join.txt", graph.has_audio, t, encoder, opts);
+            self.encode_args(
+                &mut cmd,
+                "join.txt",
+                graph.has_audio,
+                t,
+                encoder,
+                opts,
+                video_kbps,
+            );
             let mut m = run_with_progress(cmd, output, t.duration_us, &mut |p| {
                 on_progress(Progress {
                     fraction: 0.5 + 0.5 * p.fraction,
@@ -291,6 +373,7 @@ impl Renderer {
     }
 
     /// Filter script, stream maps and the final encode settings.
+    #[allow(clippy::too_many_arguments)]
     fn encode_args(
         &self,
         cmd: &mut Command,
@@ -299,18 +382,27 @@ impl Renderer {
         t: &ResolvedTimeline,
         encoder: Encoder,
         opts: &RenderOptions,
+        video_kbps: Option<u32>,
     ) {
         self.filter_arg(cmd, script);
         cmd.args(["-map", "[vout]"]);
         if has_audio {
-            cmd.args([
-                "-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            ]);
+            let ab = if video_kbps.is_some() {
+                format!("{CAPPED_AUDIO_KBPS}k")
+            } else {
+                "192k".to_owned()
+            };
+            cmd.args(["-map", "[aout]", "-c:a", "aac", "-b:a"])
+                .arg(ab)
+                .args(["-ar", "48000"]);
         }
-        cmd.args(encoder.codec_args(opts.quality))
-            .arg("-r")
-            .arg(format!("{}/{}", t.output.fps.num, t.output.fps.den))
-            .args(["-fps_mode", "cfr", "-movflags", "+faststart"]);
+        cmd.args(match video_kbps {
+            Some(k) => encoder.bitrate_args(opts.quality, k),
+            None => encoder.codec_args(opts.quality),
+        })
+        .arg("-r")
+        .arg(format!("{}/{}", t.output.fps.num, t.output.fps.den))
+        .args(["-fps_mode", "cfr", "-movflags", "+faststart"]);
     }
 
     fn stream_copy(
@@ -319,6 +411,11 @@ impl Renderer {
         output: &Path,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<RenderMetrics> {
+        if !t.extra_sources.is_empty() {
+            return Err(RenderError::CopyUnsupported(
+                "the timeline reads several source files".into(),
+            ));
+        }
         let keys = keyframes(&self.info.tools, &t.source.path)?;
         let work = tempfile::Builder::new()
             .prefix("detent-preview-")
@@ -365,11 +462,36 @@ pub fn copy_eligible(t: &ResolvedTimeline) -> bool {
         || o.audio_mix != detent_core::edl::AudioMix::Source
         || t.splices.iter().any(|s| s.flash)
         || !t.inserts.is_empty()
-        || t.sound.is_some();
-    !finishing && !t.needs_reframe() && t.captions.as_ref().is_none_or(|c| c.blocks.is_empty())
+        || t.sound.is_some()
+        || o.progress_bar
+        || t.logo.is_some()
+        || !t.extra_sources.is_empty()
+        || t.segments.iter().any(|s| s.speed != 1.0 || s.gamma != 1.0);
+    !finishing && !t.needs_reframe() && !has_burned_text(t)
 }
 
-fn source_input(cmd: &mut Command, input: &InputSpec, src: &str) {
+/// True when the render burns an `.ass` overlay: caption blocks, a
+/// headline, chapter labels or on-screen texts.
+pub fn has_burned_text(t: &ResolvedTimeline) -> bool {
+    !t.texts.is_empty()
+        || t.captions
+            .as_ref()
+            .is_some_and(|c| !c.blocks.is_empty() || c.headline.is_some() || !c.chapters.is_empty())
+}
+
+/// Paths of every timeline source, in `source` order.
+fn source_paths(t: &ResolvedTimeline) -> Vec<String> {
+    std::iter::once(&t.source)
+        .chain(&t.extra_sources)
+        .map(|s| s.path.clone())
+        .collect()
+}
+
+fn source_input(cmd: &mut Command, input: &InputSpec, sources: &[String]) {
+    let src = sources
+        .get(input.source)
+        .or_else(|| sources.first())
+        .map_or("", String::as_str);
     cmd.arg("-ss")
         .arg(format!("{:.6}", input.seek_s))
         .arg("-t")
@@ -532,5 +654,6 @@ fn run_with_progress(
         },
         realtime_factor: if wall > 0.0 { out_s / wall } else { 0.0 },
         keyframe_drift_ms: None,
+        video_kbps: None,
     })
 }

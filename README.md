@@ -7,6 +7,10 @@
 ![MCP](https://img.shields.io/badge/MCP-server-blueviolet)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
+![A rambling 25-second stream becomes a 5.5-second vertical short: hook first, dead air cut, headline, on-screen text and a progress bar](docs/demo.gif)
+
+<sub>The demo footage is generated (a fractal zoom and a text-to-speech voice), so it can be shared freely. The edit is one `detent solve` + `detent render` of [this EDL](examples/demo.json).</sub>
+
 detent is a local-first media indexer, Semantic EDL solver and [MCP](https://modelcontextprotocol.io) video engine, written in Rust.
 
 An LLM decides **what** to keep and in which order. A deterministic solver decides **exactly where** each cut lands and **how** the camera and audio move. The model never writes an FFmpeg filter, a frame number or a pixel coordinate.
@@ -36,6 +40,13 @@ detent: 5 cuts snapped into breath gaps, 0 inside words, dead air removed,
 | The right layout | `Crop` for talking heads with subject tracking; `FitBlur` / `FitBlurTall` for gameplay, screen shares and facecam streams |
 | Intentional transitions | Clean cuts by default; `Flash` (4 white frames) for kills, shocks and beat drops |
 | Phone-ready finish | `grade: MobilePop` (+8% contrast, +5% saturation, light sharpen) and `audio_mix: VoiceForward` (rumble cut, 3:1 compression, -14 LUFS, -3 dBTP peaks) |
+| Cut across a whole footage folder | `detent index footage/` indexes every video; each clip names its `source`, so one edit mixes many files. Different resolutions and frame rates are converted, and files with no sound track play silence |
+| Never show stream lag | The indexer finds frozen-picture stretches (repeated frames or timestamp gaps from a lagging stream capture, but never a genuinely still shot) and the solver cuts them out of every clip |
+| Text with no speech behind it | `texts`: "show this from here to here" lines for music trailers and silent product footage. `headline` and `chapters` no longer need a transcript either |
+| Slow-mo replays | `speed` from 0.25x to 4x per clip, with pitch-kept audio: repeat the payoff at 0.5x right after it plays |
+| Dark footage, progress bar, logo | `output.exposure: Auto` lifts only the dark clips (measured per second while indexing); `output.progress_bar` draws a filling bar; `logo` places a watermark |
+| Upload limits | `--max-size-mb 9.5` (Instagram's web uploader rejects files over 10 MB): the bitrate is computed from the length and the encode is redone lower if the file still comes out too big |
+| Campaign rules | `detent check rules.json` tests the edit, the file and the caption against a paid campaign's rules (approved caption lines word for word, allowed hashtags and mentions, banned words on screen, no music, official footage only, 9:16, size) and prints the steps only a person can do |
 
 Everything runs on your machine with FFmpeg, local whisper.cpp and an optional ONNX face detector. Hardware encoding (NVENC, VideoToolbox, VA-API) is detected and verified automatically.
 
@@ -81,8 +92,8 @@ flowchart LR
 | `detent-core` | `MediaIndex`, `SemanticEdl` schema, streaming DSP, spring camera, caption chunker, `EdlSolver`, `ResolvedTimeline` + invariant checker | none (pure) |
 | `detent-indexer` | Decoder traits, FFmpeg streaming decoders, shot detection, saliency, contact sheets, `whisper` / `onnx` adapters | FFmpeg child processes |
 | `detent-renderer` | Encoder discovery, filtergraph compiler, render execution (EDLs over 32 clips render in lossless FFV1 batches, then one join pass applies the cross-batch crossfades, grade and captions), stream-copy preview | FFmpeg child processes |
-| `detent-mcp` | `rmcp` stdio server with four tools | stdio |
-| `detent-cli` | `detent index · solve · render · mcp · schema · encoders · bench` | filesystem |
+| `detent-mcp` | `rmcp` stdio server with five tools | stdio |
+| `detent-cli` | `detent index · solve · render · check · mcp · schema · encoders · bench` | filesystem |
 
 ## Quick start
 
@@ -144,6 +155,28 @@ solved 5 clip(s) → 1080x1920@60.000 (45.18s), 7 adjustment(s)
 
 `detent schema edl` prints the JSON Schema the model is held to.
 
+### A folder of footage (paid clipping campaigns)
+
+Campaigns hand out a folder of official clips, not one long video. Index the folder once, then point clips at files with `source` (0 is the index you pass first, 1 the first `--source`, and so on); [`examples/multisource.json`](examples/multisource.json) mixes three files with on-screen text and a slow-mo replay.
+
+```bash
+detent index footage/
+```
+
+```bash
+detent solve "footage/a.mp4.detent/index.json" examples/multisource.json -s "footage/b.mp4.detent/index.json" -s "footage/c.mp4.detent/index.json" -o timeline.json
+```
+
+```bash
+detent render timeline.json -o short.mp4 --max-size-mb 9.5
+```
+
+```bash
+detent check examples/campaign.json --timeline timeline.json --video short.mp4 --caption "Acme just showed off the Widget @acme #ad"
+```
+
+`detent check` exits with status 2 when a rule fails, so it can gate an upload script. `detent schema campaign` prints the rules format; [`examples/campaign.json`](examples/campaign.json) is a complete example.
+
 ## Claude Code / Claude Desktop (MCP)
 
 ```bash
@@ -164,8 +197,9 @@ For Claude Desktop, add this to `claude_desktop_config.json`:
 |---|---|---|
 | `index_media` | `path`, optional `transcript_json`, `whisper_model`, `language`, `out_dir` | `index_path`, a bounded **digest** (sentence-level phrases with ms timings, natural cut windows, emphasis peaks, shot changes, a 240-point loudness curve, and a `framing_hint` such as `PipFacecam`), and the contact sheet as an image |
 | `inspect_keyframes` | `index_path`, `start_ms`, `end_ms`, grid size | a timestamped JPEG grid for that range |
-| `solve_and_validate_edl` | `index_path`, `edl` (`SemanticEdl`) | `timeline_path`, frame-exact cut list, adjustments, diagnostics; or **all** validation issues as JSON pointers |
-| `render_timeline` | `resolved_timeline_path`, `output_path`, `quality`, `mode`, `encoder` | encoder used, frames, fps, realtime factor |
+| `solve_and_validate_edl` | `index_path`, optional `extra_index_paths` (clip `source` 1, 2, …), `edl` (`SemanticEdl`) | `timeline_path`, frame-exact cut list, adjustments, diagnostics; or **all** validation issues as JSON pointers |
+| `render_timeline` | `resolved_timeline_path`, `output_path`, `quality`, `mode`, `encoder`, optional `max_size_mb` | encoder used, frames, fps, realtime factor, capped bitrate |
+| `check_campaign` | `rules_path`, optional `timeline_path`, `video_path`, `caption` | pass / fail / skipped per rule, plus the manual reminders |
 
 The digest is sized by `DigestLimits`, so a two-hour file costs the model about as many tokens as its transcript.
 
@@ -199,7 +233,9 @@ The digest is sized by `DigestLimits`, so a two-hour file costs the model about 
 }
 ```
 
-Motion presets are `None`, `SpringPunchIn`, `SmoothTrackSubject` and `SlowCreep`. Audio transitions are `Hard`, `AutoJCut` and `AutoLCut` (offset 150–300 ms); video transitions are `Cut` (default) and `Flash`. Caption styles are `BoldPop`, `Minimal`, `Karaoke`, `WordBounce` and `WordPunch`; `word_colors` takes `Red`, `Yellow`, `Green`, `Blue`, `Orange` or `Pink` and overrides the green of `highlight_words`. Inserts are PNG, JPEG or WebP images or MP4, MOV, WebM or MKV clips (played muted from their start, looping if short), placed as cards `Upper` (default), `Center` or `Lower` (scaled to fit 80% of the width and 32% of the height) or as a `Fullscreen` cutaway. `sound.cut_sfx` is `None`, `Whoosh` or `Click`, `pop_sfx` is `None` or `Pop`; the effects are generated by FFmpeg, so no sample files are needed. Music must be a track you have the rights to; chapters need `captions`, like the headline. `output.layout` is `Crop` (camera crops a 9:16 window; for talking heads), `FitBlur` (the full 16:9 frame over a blurred fill; for screen, gameplay and reaction footage, where cropping would discard the content) or `FitBlurTall` (a taller 4:5 window over the blur, for action near the centre).
+Motion presets are `None`, `SpringPunchIn`, `SmoothTrackSubject` and `SlowCreep`. Audio transitions are `Hard`, `AutoJCut` and `AutoLCut` (offset 150–300 ms); video transitions are `Cut` (default) and `Flash`. Caption styles are `BoldPop`, `Minimal`, `Karaoke`, `WordBounce` and `WordPunch`; `word_colors` takes `Red`, `Yellow`, `Green`, `Blue`, `Orange` or `Pink` and overrides the green of `highlight_words`. Inserts are PNG, JPEG or WebP images or MP4, MOV, WebM or MKV clips (played muted from their start, looping if short), placed as cards `Upper` (default), `Center` or `Lower` (scaled to fit 80% of the width and 32% of the height) or as a `Fullscreen` cutaway. `sound.cut_sfx` is `None`, `Whoosh` or `Click`, `pop_sfx` is `None` or `Pop`; the effects are generated by FFmpeg, so no sample files are needed. Music must be a track you have the rights to. The headline and chapters render with or without `captions`. `output.layout` is `Crop` (camera crops a 9:16 window; for talking heads), `FitBlur` (the full 16:9 frame over a blurred fill; for screen, gameplay and reaction footage, where cropping would discard the content) or `FitBlurTall` (a taller 4:5 window over the blur, for action near the centre).
+
+Clips take an optional `source` (which indexed file; default 0) and `speed` (0.25–4, default 1; audio is time-stretched with `atempo`, pitch kept). `texts` entries show a line from `offset_ms` into `clip` for `duration_ms`, or until the end of `end_clip` (default: the same clip), at `Upper` (default), `Center` or `Lower`, styled `Bold` (white, heavy stroke, pops in), `Boxed` (black on white) or `Yellow`; a newline breaks the line. `drop_freezes` (default `true`) cuts frozen-picture stretches out of clips; with `false` the solver only warns. `output.exposure` is `None`, `Lift` (gamma 1.25 everywhere) or `Auto` (gamma up to 1.45 on clips whose mean luma is under 0.36). `output.progress_bar` adds a yellow bar along the bottom; `logo` takes an image `path`, a `placement` (`TopCenter`, `TopLeft`, `TopRight`, `BottomCenter`) and `width_pct` (10–60, default 28). The output raster and frame rate come from source 0; segments from other frame rates or speeds are retimed onto that clock with the frame count rounded on the cumulative output clock, so the total never drifts by more than half a frame.
 
 `tighten` runs before the solver. It splits each clip at pauses longer than `max_silence_ms`, keeps 60 ms of room tone on each side, never cuts a pause that overlaps a transcript word and never leaves a piece shorter than 300 ms. Those internal edges are pinned exactly, because snapping them into the pause valley would put the silence back. Motion cues are copied onto every piece, and transitions stay on the splice between the clips you wrote.
 
@@ -240,7 +276,8 @@ This is unconditionally stable and independent of frame rate. The impulse respon
 
 - frame-aligned, positive-length video ranges inside the source;
 - monotonic output timestamps, with `duration = Σ segments`;
-- audio inside the source, and `Σ audio − Σ crossfades = Σ video` exactly;
+- every segment reads a source that exists, at a speed within `[0.25, 4]`;
+- audio inside the source, and `Σ audio − Σ crossfades = Σ video` exactly (on the output clock; a speed-changed segment may round by 2 µs);
 - crossfades in `[0, 25 ms]` and never longer than either neighbour;
 - J/L offsets equal to 0 or within `[150, 300] ms`;
 - crop windows non-empty, inside the source and at the output aspect;
@@ -357,6 +394,8 @@ Tests that need FFmpeg skip with a message when it is not installed. CI runs `fm
 ## Limitations
 
 - The default subject tracker is still a heuristic, not a face detector. It splits motion and skin-tone saliency into blobs and follows one subject with hysteresis, preferring whoever moves. In a two-person shot it frames a person rather than the wall between them, but it can mistake a gesturing hand for a head. Use `onnx` for real face detection; against ONNX Runtime 1.24.4 it found 42 faces in a ~50-person group photo, and the gated `onnx_faces` test checks box sanity and subject stability on real photos.
+- Freeze detection needs motion on both sides of the freeze, so a lag that happens during an already still shot is not reported (it is also invisible). Variable-frame-rate captures are resampled to their nominal rate while indexing and rendering, which turns timestamp gaps into repeated frames that the detector then finds.
+- J/L cuts are skipped at a splice where either clip changes speed or comes from a file with no sound.
 - A J/L cut is downgraded to a hard cut (with a micro-crossfade) only when speech is continuous on *both* sides of the splice, so neither the audio nor the picture can move without leaking or dropping a word.
 
 ## License

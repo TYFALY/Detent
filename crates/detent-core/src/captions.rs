@@ -11,8 +11,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::edl::{AccentColor, CaptionGrouping, CaptionPosition, CaptionStyle, WordColor};
-use crate::timeline::ResolvedChapter;
+use crate::edl::{
+    AccentColor, CaptionGrouping, CaptionPosition, CaptionStyle, TextPosition, TextStyle, WordColor,
+};
+use crate::timeline::{ResolvedChapter, ResolvedText};
 
 /// A word positioned on the output timeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -275,6 +277,8 @@ pub struct AssExtras<'a> {
     pub word_colors: &'a [WordColor],
     /// Persistent section labels.
     pub chapters: &'a [ResolvedChapter],
+    /// On-screen texts (independent of speech).
+    pub texts: &'a [ResolvedText],
 }
 
 /// Renders blocks to a complete `.ass` document for a `width x height` canvas.
@@ -469,7 +473,43 @@ pub fn to_ass_with(
         h * 0.19,
         m = (f64::from(width) * 0.06).round(),
     ));
+    // On-screen texts: heavy white with a thick stroke, boxed, or yellow.
+    let tm = (f64::from(width) * 0.07).round();
+    out.pop();
+    for (name, primary, outline, border_style, outline_w) in [
+        ("TextBold", "&H00FFFFFF", "&H00000000", 1, h * 0.0062),
+        ("TextBoxed", "&H00000000", "&H00FFFFFF", 3, h * 0.011),
+        ("TextYellow", "&H0000E6FF", "&H00000000", 1, h * 0.0062),
+    ] {
+        out.push_str(&format!(
+            "Style: {name},Arial Black,{:.0},{primary},{primary},{outline},&H78000000,-1,0,0,0,100,100,0,0,{border_style},{outline_w:.1},{:.1},8,{tm},{tm},0,1\n",
+            h * 0.044,
+            h * 0.0025,
+        ));
+    }
+    out.push('\n');
     out.push_str("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
+    for t in extras.texts {
+        if t.end_us <= t.start_us || t.text.trim().is_empty() {
+            continue;
+        }
+        let style = match t.style {
+            TextStyle::Bold => "TextBold",
+            TextStyle::Boxed => "TextBoxed",
+            TextStyle::Yellow => "TextYellow",
+        };
+        let (an, margin) = match t.position {
+            TextPosition::Upper => (8, (h * 0.17).round()),
+            TextPosition::Center => (5, 0.0),
+            TextPosition::Lower => (2, (h * 0.30).round()),
+        };
+        out.push_str(&format!(
+            "Dialogue: 2,{},{},{style},,0,0,{margin:.0},,{{\\an{an}\\fscx80\\fscy80\\t(0,100,\\fscx100\\fscy100)}}{}\n",
+            ass_time(t.start_us),
+            ass_time(t.end_us),
+            wrap_headline(&t.text)
+        ));
+    }
     if let Some(hl) = extras.headline.filter(|h| !h.trim().is_empty()) {
         let full = extras
             .duration_us
@@ -729,6 +769,7 @@ mod tests {
                 headline_end_us: None,
                 word_colors: &[],
                 chapters: &[],
+                texts: &[],
             },
         );
         assert!(doc.contains("Style: Headline,"));
@@ -754,6 +795,7 @@ mod tests {
                 headline_end_us: Some(3_000_000),
                 word_colors: &[],
                 chapters: &[],
+                texts: &[],
             },
         );
         let head = doc.lines().find(|l| l.contains(",Headline,,")).unwrap();
@@ -836,6 +878,7 @@ mod tests {
                 highlight_words: &hot,
                 word_colors: &colors,
                 chapters: &chapters,
+                texts: &[],
                 duration_us: 3_000_000,
                 ..AssExtras::default()
             },

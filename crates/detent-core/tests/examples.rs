@@ -26,3 +26,42 @@ fn shortform_example_parses_and_solves() {
     );
     assert_eq!(t.splices.iter().filter(|s| s.flash).count(), 1);
 }
+
+#[test]
+fn multisource_example_parses_and_solves() {
+    let edl = SemanticEdl::from_json(include_str!("../../../examples/multisource.json")).unwrap();
+    let idx: Vec<_> = (1..=3).map(|seed| synthetic_index(30_000, seed)).collect();
+    let res = detent_core::EdlSolver::default()
+        .solve_sources(&edl, &idx)
+        .unwrap();
+    let t = &res.timeline;
+    assert!(t.verify().is_empty());
+    assert_eq!(t.extra_sources.len(), 2);
+    assert_eq!(t.texts.len(), 3);
+    assert_eq!(t.segments.last().unwrap().speed, 0.5);
+}
+
+#[test]
+fn campaign_example_parses_and_checks() {
+    use detent_core::campaign::{CampaignRules, CheckInput, Status, check};
+    let rules = CampaignRules::from_json(include_str!("../../../examples/campaign.json")).unwrap();
+    let r = check(
+        &rules,
+        &CheckInput {
+            caption: Some("Acme just showed off the Widget @acme #ad"),
+            ..CheckInput::default()
+        },
+    );
+    assert!(r.ok);
+    assert!(r.checks.iter().any(|c| c.status == Status::Skipped));
+    assert_eq!(r.reminders.len(), 3);
+}
+
+#[test]
+fn demo_example_parses_and_solves() {
+    let edl = SemanticEdl::from_json(include_str!("../../../examples/demo.json")).unwrap();
+    let idx = synthetic_index(30_000, 7);
+    let res = detent_core::EdlSolver::default().solve(&edl, &idx).unwrap();
+    assert!(res.timeline.verify().is_empty());
+    assert_eq!(res.timeline.texts.len(), 3);
+}
